@@ -1,0 +1,21 @@
+{
+  "name": "nai-proxy",
+  "version": "1.0.0",
+  "description": "NovelAI 拼车分发服务：统一出口 IP + 串行队列转发（key 只在服务端）",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "mock": "node test/mock-nai.js",
+    "smoke": "node test/smoke.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "express": "^4.19.2"
+  },
+  "devDependencies": {
+    "jszip": "^3.10.1"
+  }
+}

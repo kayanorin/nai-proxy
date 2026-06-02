@@ -1,0 +1,27 @@
+# Render 蓝图（可选）。也可以直接在 Render 后台手动建 Web Service。
+# 用法：把本仓库连到 Render，它会读这个文件。NAI_KEY / ACCESS_TOKENS 留空，
+# 部署后在后台 Environment 里填（sync:false 表示不从蓝图同步、由后台管理）。
+
+services:
+  - type: web
+    name: nai-proxy
+    runtime: node
+    plan: free
+    # region 决定出口 IP 网段，选一个就别频繁换（保持单一出口的稳定性）
+    region: oregon
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /
+    envVars:
+      - key: NAI_KEY
+        sync: false
+      - key: ACCESS_TOKENS
+        sync: false
+      - key: MIN_GAP_MS
+        value: "12000"
+      - key: RESULT_TTL_MS
+        value: "600000"
+      - key: MAX_SAMPLES
+        value: "0"
+      - key: MAX_STEPS
+        value: "0"
