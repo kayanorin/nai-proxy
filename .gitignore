@@ -4,3 +4,4 @@ node_modules/
 .DS_Store
 npm-debug.log*
 *.log
+验证清单.md
