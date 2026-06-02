@@ -25,3 +25,9 @@ services:
         value: "0"
       - key: MAX_STEPS
         value: "0"
+      # 用量统计管理员令牌（车主专用，看 /stats）。留空则 /stats 关闭。
+      - key: ADMIN_TOKEN
+        sync: false
+      # Anlas 估算口径：Opus 账号保持 true；非 Opus 设 false
+      - key: OPUS_FREE
+        value: "true"

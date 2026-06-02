@@ -44,6 +44,10 @@ export function loadConfig(env = process.env) {
 
     // Express body 上限：vibe encoding 较大（单个 ~64KB，可能多个），给足余量
     bodyLimit: env.BODY_LIMIT || '12mb',
+
+    // 用量统计 / 管理端
+    adminToken: env.ADMIN_TOKEN || '',     // 设了才开 /stats、/stats/reset（车主专用）
+    opusFree: env.OPUS_FREE !== 'false',   // Anlas 估算是否按 Opus 免费档（默认 true）
   };
 }
 

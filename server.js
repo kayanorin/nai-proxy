@@ -9,6 +9,8 @@ import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
 import { JobQueue } from './queue.js';
 import { callNAIWithRetry } from './nai.js';
+import { estimateAnlas } from './anlas.js';
+import { UsageStats } from './stats.js';
 
 export function createApp(config) {
   const app = express();
@@ -26,6 +28,10 @@ export function createApp(config) {
     next();
   });
 
+  // 按令牌累计用量（内存聚合；逐条账本走下面 onSettled 里的 stdout `usage` 日志）
+  const stats = new UsageStats();
+  app.set('stats', stats);
+
   const queue = new JobQueue({
     minGapMs: config.minGapMs,
     resultTtlMs: config.resultTtlMs,
@@ -37,6 +43,25 @@ export function createApp(config) {
         signal,
         ...config.retry,
       }),
+    // 任务结束回调：只对成功(done)计点，并写一条结构化用量日志（车主看 Render 日志长期对账）
+    onSettled: (job) => {
+      if (job.status !== 'done') return;
+      const anlas = typeof job.anlasEst === 'number'
+        ? job.anlasEst
+        : estimateAnlas(job.body, { opus: config.opusFree });
+      stats.record(job.token, anlas);
+      const p = (job.body && job.body.parameters) || {};
+      console.log(JSON.stringify({
+        evt: 'usage',
+        at: new Date().toISOString(),
+        token: job.token,
+        model: job.body && job.body.model,
+        size: `${p.width || '?'}x${p.height || '?'}`,
+        steps: p.steps,
+        samples: p.n_samples || 1,
+        anlas,
+      }));
+    },
   });
   queue.startReaper(config.reapIntervalMs);
   app.set('queue', queue); // 便于测试 introspect
@@ -87,7 +112,17 @@ export function createApp(config) {
     }
     clampBody(body, config);
     const id = queue.submit(req.token, body);
-    res.json({ job_id: id, status: 'queued', position: queue.position(id) });
+    const job = queue.get(id);
+    // 估点一次存到 job 上：/status 复用、完成计入统计，三处同一个数
+    job.anlasEst = estimateAnlas(body, { opus: config.opusFree });
+    const position = queue.position(id);
+    res.json({
+      job_id: id,
+      status: 'queued',
+      position,
+      eta_ms: etaMs(position, config.minGapMs),
+      anlas_est: job.anlasEst,
+    });
   });
 
   // ---- 轮询状态 ----
@@ -95,10 +130,15 @@ export function createApp(config) {
     const job = queue.get(req.params.id);
     if (!job) return notFound(res);
     if (job.token !== req.token) return forbidden(res);
+    const position = queue.position(job.id);
     res.json({
       job_id: job.id,
       status: job.status,
-      position: queue.position(job.id),
+      position,
+      eta_ms: etaMs(position, config.minGapMs),
+      anlas_est: typeof job.anlasEst === 'number'
+        ? job.anlasEst
+        : estimateAnlas(job.body, { opus: config.opusFree }),
       error: job.error,
       code: job.errorCode,
     });
@@ -128,6 +168,24 @@ export function createApp(config) {
     res.json({ cancelled: ok, status: job.status });
   });
 
+  // ---- 用量统计（车主专用，设了 ADMIN_TOKEN 才开；朋友令牌看不到）----
+  const adminAuth = (req, res, next) => {
+    if (!config.adminToken) {
+      return res.status(404).json({ error: 'stats 未启用（设 ADMIN_TOKEN 开启）', code: 'STATS_DISABLED' });
+    }
+    if ((req.get('X-Access-Token') || '') !== config.adminToken) {
+      return res.status(401).json({ error: '需要管理员令牌', code: 'BAD_ADMIN' });
+    }
+    next();
+  };
+  // { since, totals:{count,anlas}, tokens:{ <token>:{count,anlas,lastAt} } }
+  app.get('/stats', adminAuth, (req, res) => res.json(stats.snapshot()));
+  // 按账期手动清零（不调也行——Render 免费档重启会自然清零）
+  app.post('/stats/reset', adminAuth, (req, res) => {
+    stats.reset();
+    res.json({ ok: true, since: stats.snapshot().since });
+  });
+
   return app;
 }
 
@@ -138,6 +196,12 @@ function notFound(res) {
 }
 function forbidden(res) {
   return res.status(403).json({ error: '无权访问该任务', code: 'FORBIDDEN' });
+}
+
+// 预估等待（毫秒）：队列里第 position 位 ≈ position × 串行间隔才轮到自己开跑。
+// NAI 同时只跑 1 个，算不算正在跑的那个只差一格、对体感无所谓；不在队列(运行中/已结束)记 0。
+function etaMs(position, gapMs) {
+  return position != null && position > 0 ? position * gapMs : 0;
 }
 
 // 可选的参数 clamp，防误操作烧 Anlas（0 = 不限制）

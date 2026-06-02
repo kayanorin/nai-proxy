@@ -13,8 +13,9 @@ export class JobQueue {
    * @param {number} [opts.resultTtlMs]
    * @param {number} [opts.maxJobs]
    */
-  constructor({ runner, minGapMs = 12000, resultTtlMs = 600000, maxJobs = 200 }) {
+  constructor({ runner, onSettled = null, minGapMs = 12000, resultTtlMs = 600000, maxJobs = 200 }) {
     this.runner = runner;
+    this.onSettled = onSettled;
     this.minGapMs = minGapMs;
     this.resultTtlMs = resultTtlMs;
     this.maxJobs = maxJobs;
@@ -138,6 +139,13 @@ export class JobQueue {
           job.errorCode = e?.code || 'ERROR';
         } finally {
           if (!job.finishedAt) job.finishedAt = Date.now();
+          if (this.onSettled) {
+            try {
+              this.onSettled(job);
+            } catch (e) {
+              console.error('[queue] onSettled 回调出错：', e);
+            }
+          }
         }
       }
     } finally {
