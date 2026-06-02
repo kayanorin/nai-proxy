@@ -124,6 +124,7 @@ await test('健康检查 + CORS 预检', () =>
     assert(opt.status === 204, `预检应 204，实际 ${opt.status}`);
     const allow = opt.headers.get('access-control-allow-headers') || '';
     assert(allow.includes('X-Access-Token'), 'CORS 应允许 X-Access-Token');
+    assert(allow.toLowerCase().includes('authorization'), 'CORS 应允许 Authorization（NAI 兼容端点必需）');
   }));
 
 await test('无令牌 / 错令牌 → 401', () =>
@@ -143,6 +144,36 @@ await test('提交 → 轮询 → 取 zip（含 PNG）', () =>
     const zip = await JSZip.loadAsync(Buffer.from(await rr.arrayBuffer()));
     const pngs = Object.keys(zip.files).filter((n) => n.endsWith('.png'));
     assert(pngs.length === 2, `应含 2 张 PNG，实际 ${pngs.length}`);
+  }));
+
+await test('NAI 兼容端点：Bearer 令牌 → 同步取 zip（含 PNG）', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    const r = await fetch(base + '/ai/generate-image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer tok1' },
+      body: JSON.stringify(naiBody('1girl', { n_samples: 2 })),
+    });
+    assert(r.status === 200, `应 200，实际 ${r.status}`);
+    assert((r.headers.get('content-type') || '').includes('zip'), '应原样回传 zip');
+    const zip = await JSZip.loadAsync(Buffer.from(await r.arrayBuffer()));
+    const pngs = Object.keys(zip.files).filter((n) => n.endsWith('.png'));
+    assert(pngs.length === 2, `应含 2 张 PNG，实际 ${pngs.length}`);
+  }));
+
+await test('NAI 兼容端点：无/错 Bearer 令牌 → 401', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    const noTok = await fetch(base + '/ai/generate-image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(naiBody()),
+    });
+    assert(noTok.status === 401, `无令牌应 401，实际 ${noTok.status}`);
+    const badTok = await fetch(base + '/ai/generate-image', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: 'Bearer nope' },
+      body: JSON.stringify(naiBody()),
+    });
+    assert(badTok.status === 401, `错令牌应 401，实际 ${badTok.status}`);
   }));
 
 await test('任务绑定令牌：他人令牌 → 403', () =>

@@ -32,8 +32,23 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `GET /status/:id` | 是 | `{status, position, error, code}`；status ∈ queued/running/done/failed/cancelled |
 | `GET /result/:id` | 是 | done 时回 `application/zip` 原始字节；未完成 409 |
 | `POST /cancel/:id` | 是 | 排队中直接移除；运行中 Abort 中断 |
+| `POST /ai/generate-image` | 是* | **NAI 原生兼容**：同步生图（入同一队列、阻塞等出图、原样回 zip/msgpack）。给只能填 NAI key 的第三方客户端用（如酒馆插件） |
 
-鉴权：请求头带 `X-Access-Token: <你的令牌>`。任务与提交它的令牌绑定，他人令牌查不到（403）。
+鉴权：网页端用请求头 `X-Access-Token: <你的令牌>`。任务与提交它的令牌绑定，他人令牌查不到（403）。
+
+> \* `/ai/generate-image` 例外：它从 `Authorization: Bearer <令牌>` 读令牌（也兼容 `X-Access-Token`），因为第三方客户端通常只有「NAI key」一个输入框——把**访问令牌**填进去即可。
+
+## 第三方客户端直连（酒馆 st-chatu8 插件等）
+
+有些客户端只能配「NAI 官方/第三方 API 地址 + 一个 key」，不支持本服务的异步 `submit→轮询→result` 协议。`POST /ai/generate-image` 就是给它们的：**长得和 NAI 官方接口一模一样**（同路径、`Authorization: Bearer`、同步返回原始响应），内部却走的是同一个队列（共用限速 / 单一真 key / 用量统计）。
+
+插件侧配置（以 st-chatu8 为例）：
+
+- **API 地址**：填本服务根地址，如 `https://your-app.onrender.com`（插件会自己拼 `/ai/generate-image`）。
+- **NAI key 栏**：填你的**访问令牌**（`ACCESS_TOKENS` 里的某一个），不是真 NAI key。
+- 其余照常。请求体里带 `stream:"msgpack"` 也没关系——服务端缓冲完整响应后原样回传，插件照常解。
+
+> 同步语义：这条接口会**一直挂着连接直到出图**（前面有人排队就更久）。NAI 同时只跑一个，拼车人少时基本等于纯生图耗时。客户端中途断开会自动取消任务、不白烧点数。
 
 ## 环境变量
 
@@ -100,7 +115,7 @@ curl -s $BASE/result/$JOB -H "X-Access-Token: $TOK" -o out.zip   # 取图
 ## 注意
 
 - **二进制**：NAI 回的是 zip，全程按 Buffer 处理，不当文本解析。
-- **CORS**：已允许任意源 + `X-Access-Token` 头，并处理预检 OPTIONS（覆盖 `file://` 的 null 源）。
+- **CORS**：已允许任意源 + `X-Access-Token` / `Authorization` 头，并处理预检 OPTIONS（覆盖 `file://` 的 null 源）。浏览器禁止脚本设 `Origin/Referer`，所以这两个头的伪装只在服务端转发那一跳生效。
 - **key 失效**：NAI 401 会映射成「车主请更新 NAI_KEY」（错误 code `KEY_INVALID`），而非裸 500。
 - **不要在网页里做热改 key 的输入框**：免费档休眠清内存，热填的 key 活不过冷启动；统一以 `NAI_KEY` 环境变量为准。
 - **信任边界**：拼车是熟人，body 透传即可；要防误操作再开 `MAX_STEPS/MAX_SAMPLES`。

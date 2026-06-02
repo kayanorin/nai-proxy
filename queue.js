@@ -71,6 +71,16 @@ export class JobQueue {
     return i < 0 ? null : i + 1;
   }
 
+  // 等待任务结束（done/failed/cancelled）；已结束则立即兑现。给同步端点（NAI 兼容路径）用。
+  waitFor(id) {
+    const job = this.jobs.get(id);
+    if (!job) return Promise.reject(new Error('job not found'));
+    if (isEnded(job)) return Promise.resolve(job);
+    return new Promise((resolve) => {
+      (job._waiters || (job._waiters = [])).push(resolve);
+    });
+  }
+
   cancel(id) {
     const job = this.jobs.get(id);
     if (!job) return false;
@@ -79,6 +89,7 @@ export class JobQueue {
       job.finishedAt = Date.now();
       const i = this.queue.indexOf(id);
       if (i >= 0) this.queue.splice(i, 1);
+      this._settle(job); // 兑现 waitFor（排队中被取消不会进 worker 的 finally）
       return true;
     }
     if (job.status === 'running') {
@@ -139,17 +150,34 @@ export class JobQueue {
           job.errorCode = e?.code || 'ERROR';
         } finally {
           if (!job.finishedAt) job.finishedAt = Date.now();
-          if (this.onSettled) {
-            try {
-              this.onSettled(job);
-            } catch (e) {
-              console.error('[queue] onSettled 回调出错：', e);
-            }
-          }
+          this._settle(job);
         }
       }
     } finally {
       this.working = false;
+    }
+  }
+
+  // 统一收尾：跑 onSettled 回调 + 兑现所有 waitFor。
+  // 两条结束路径都走这里：worker 跑完（_loop 的 finally）/ 排队中被取消（cancel）。
+  _settle(job) {
+    if (this.onSettled) {
+      try {
+        this.onSettled(job);
+      } catch (e) {
+        console.error('[queue] onSettled 回调出错：', e);
+      }
+    }
+    const waiters = job._waiters;
+    if (waiters && waiters.length) {
+      job._waiters = null;
+      for (const fn of waiters) {
+        try {
+          fn(job);
+        } catch {
+          /* ignore */
+        }
+      }
     }
   }
 
@@ -191,4 +219,8 @@ export class JobQueue {
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isEnded(job) {
+  return job.status === 'done' || job.status === 'failed' || job.status === 'cancelled';
 }

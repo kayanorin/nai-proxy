@@ -22,7 +22,8 @@ export function createApp(config) {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Vary', 'Origin');
     res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, X-Access-Token');
+    // X-Access-Token：网页端用；Authorization：NAI 原生兼容端点用（酒馆插件只能填 key→Bearer）
+    res.set('Access-Control-Allow-Headers', 'Content-Type, X-Access-Token, Authorization');
     res.set('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') return res.sendStatus(204); // 预检
     next();
@@ -168,6 +169,61 @@ export function createApp(config) {
     res.json({ cancelled: ok, status: job.status });
   });
 
+  // ---- NAI 原生兼容端点 ----
+  // 给「只能填 NAI key、且要同步拿图」的第三方客户端用（如酒馆 st-chatu8 插件）。
+  // 朋友把【访问令牌】填进插件的 key 栏 → 浏览器发 Authorization: Bearer <令牌>，
+  // 这里读出令牌、入【同一个队列】（与网页端共用限速 / 单一真 key / 用量统计），
+  // 然后【阻塞等出图】，把 NAI 原始响应（zip 或 msgpack 流，原样）同步返回。
+  const naiCompatAuth = (req, res, next) => {
+    if (config.accessTokens.size === 0) {
+      return res.status(503).json({ error: '服务端未配置 ACCESS_TOKENS', code: 'NO_TOKENS' });
+    }
+    const bearer = (req.get('authorization') || '').replace(/^Bearer\s+/i, '').trim();
+    const token = bearer || req.get('X-Access-Token') || '';
+    if (!config.accessTokens.has(token)) {
+      return res
+        .status(401)
+        .json({ error: '访问令牌无效（把【访问令牌】填到插件的 key 栏，不是 NAI key）', code: 'BAD_TOKEN' });
+    }
+    req.token = token;
+    next();
+  };
+
+  app.post('/ai/generate-image', naiCompatAuth, async (req, res) => {
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ error: 'body 必须是 NAI 请求的 JSON 对象', code: 'BAD_BODY' });
+    }
+    if (!config.naiKey) {
+      return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
+    }
+    clampBody(body, config);
+    const id = queue.submit(req.token, body);
+    const job = queue.get(id);
+    job.anlasEst = estimateAnlas(body, { opus: config.opusFree }); // 与 /submit 同口径，完成时计入统计
+
+    // 客户端断开（超时 / 手动停）时取消任务，别白烧 Anlas、也别占着 worker
+    let settled = false;
+    res.on('close', () => {
+      if (!settled) queue.cancel(id);
+    });
+
+    await queue.waitFor(id);
+    settled = true;
+
+    if (job.status === 'done') {
+      res.set('Content-Type', job.contentType || 'application/zip'); // 原样回传（zip / msgpack）
+      return res.send(job.resultBuf);
+    }
+    if (job.status === 'cancelled') {
+      return res.status(499).json({ error: '任务已取消', code: 'CANCELLED' });
+    }
+    // failed：把 NAI 错误映射成合适的 HTTP 状态（车主 key 的问题对插件用户算 502，不是他们的锅）
+    return res
+      .status(naiErrStatus(job.errorCode))
+      .json({ error: job.error || 'NAI 生成失败', code: job.errorCode || 'ERROR' });
+  });
+
   // ---- 用量统计（车主专用，设了 ADMIN_TOKEN 才开；朋友令牌看不到）----
   const adminAuth = (req, res, next) => {
     if (!config.adminToken) {
@@ -186,6 +242,12 @@ export function createApp(config) {
     res.json({ ok: true, since: stats.snapshot().since });
   });
 
+  // ---- 兜底：未匹配的路径打一条日志（便于确认第三方客户端实际打的路径），并 404 ----
+  app.use((req, res) => {
+    console.log(JSON.stringify({ evt: 'unmatched', method: req.method, path: req.path }));
+    res.status(404).json({ error: '未知路径：' + req.path, code: 'NO_ROUTE' });
+  });
+
   return app;
 }
 
@@ -196,6 +258,20 @@ function notFound(res) {
 }
 function forbidden(res) {
   return res.status(403).json({ error: '无权访问该任务', code: 'FORBIDDEN' });
+}
+
+// NAI 失败码 → 对外 HTTP 状态（给 NAI 原生兼容端点用）。
+function naiErrStatus(code) {
+  switch (code) {
+    case 'INSUFFICIENT_FUNDS':
+      return 402; // NAI 余额不足
+    case 'RATE_LIMITED':
+      return 429; // 持续限流
+    case 'ABORTED':
+      return 499; // 已取消
+    default:
+      return 502; // KEY_INVALID / NETWORK / NAI_5xx 等：一律当上游网关错误
+  }
 }
 
 // 预估等待（毫秒）：队列里第 position 位 ≈ position × 串行间隔才轮到自己开跑。
