@@ -29,6 +29,12 @@ export async function callNAIWithRetry(
           Authorization: 'Bearer ' + apiKey,
           'Content-Type': 'application/json',
           Accept: 'application/zip, application/x-zip-compressed, */*',
+          // 伪装成 NAI 官网发出的请求：降低被判定为「外部非法调用」的概率（共享账号防封）。
+          // 浏览器禁止脚本设置 Origin/Referer，但 Node(undici) 不拦，会原样发出。
+          Origin: 'https://novelai.net',
+          Referer: 'https://novelai.net/',
+          'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
         },
         body: JSON.stringify(body),
         signal,

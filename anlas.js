@@ -5,8 +5,8 @@
 //
 // 估算口径：
 //  · 单张原始点数用社区常见的 NAI 估算式（约 1024×1024 / 28 步 ≈ 20 点）。
-//  · Opus 免费档：单张 ≤ 1024×1024 且 steps ≤ 28 记 0 点（含批量，按 Opus「免费生成」处理）。
-//  · 超出免费档（更大尺寸 / 更高步数）：perSample × n_samples。
+//  · Opus 免费档（单张 ≤ 1024×1024 且 steps ≤ 28）：免费覆盖 1 张，批量里多出的按张计。
+//  · 超出免费档（更大尺寸 / 更高步数）：全部按张计 perSample × n_samples。
 //  · 非 Opus（OPUS_FREE=false）：一律 perSample × n_samples。
 export function estimateAnlas(body, { opus = true } = {}) {
   const p = (body && body.parameters) || {};
@@ -21,7 +21,9 @@ export function estimateAnlas(body, { opus = true } = {}) {
     2951823174884865e-21 * area + 5.753298233447344e-7 * area * steps
   );
   const withinOpusFree = opus && area <= 1024 * 1024 && steps <= 28;
-  return withinOpusFree ? 0 : perSample * samples;
+  // Opus 免费档免费覆盖单张；批量里多出的 (samples-1) 张按张计。非 Opus / 超规格：全部按张计。
+  const billable = withinOpusFree ? Math.max(0, samples - 1) : samples;
+  return billable * perSample;
 }
 
 function num(v) {
