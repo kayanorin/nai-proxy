@@ -8,15 +8,24 @@ import { randomUUID } from 'node:crypto';
 export class JobQueue {
   /**
    * @param {object} opts
-   * @param {(body:object, signal:AbortSignal)=>Promise<{buf:Buffer,contentType:string}>} opts.runner
+   * @param {(job:object, signal:AbortSignal)=>Promise<{buf:Buffer,contentType:string}>} opts.runner
    * @param {number} [opts.minGapMs]
+   * @param {number} [opts.encodeMinGapMs]  vibe 编码任务的间隔（比生图便宜快，可以更密）
    * @param {number} [opts.resultTtlMs]
    * @param {number} [opts.maxJobs]
    */
-  constructor({ runner, onSettled = null, minGapMs = 12000, resultTtlMs = 600000, maxJobs = 200 }) {
+  constructor({
+    runner,
+    onSettled = null,
+    minGapMs = 12000,
+    encodeMinGapMs = null,
+    resultTtlMs = 600000,
+    maxJobs = 200,
+  }) {
     this.runner = runner;
     this.onSettled = onSettled;
     this.minGapMs = minGapMs;
+    this.encodeMinGapMs = encodeMinGapMs;
     this.resultTtlMs = resultTtlMs;
     this.maxJobs = maxJobs;
 
@@ -29,12 +38,15 @@ export class JobQueue {
     this._reaper = null;
   }
 
-  submit(token, body) {
+  // kind：'generate'（生图）| 'encode-vibe'（vibe 编码）。决定 worker 打哪个 NAI 接口、用哪档限速，
+  // 所以必须在入队时就定下来——worker 可能在 submit() 返回前就已经开跑。
+  submit(token, body, kind = 'generate') {
     const id = randomUUID();
     const job = {
       id,
       token,
       body,
+      kind,
       status: 'queued', // queued | running | done | failed | cancelled
       resultBuf: null,
       contentType: null,
@@ -121,8 +133,12 @@ export class JobQueue {
           continue;
         }
 
-        // 限速：与上次请求起点间隔 ≥ minGapMs
-        const wait = this.minGapMs - (Date.now() - this.lastStartAt);
+        // 限速：与上次请求起点间隔 ≥ 该类型的最小间隔
+        const gap =
+          job.kind === 'encode-vibe' && this.encodeMinGapMs != null
+            ? this.encodeMinGapMs
+            : this.minGapMs;
+        const wait = gap - (Date.now() - this.lastStartAt);
         if (wait > 0) await sleep(wait);
 
         // 等待期间可能被取消
@@ -138,7 +154,7 @@ export class JobQueue {
         this.lastStartAt = Date.now();
 
         try {
-          const { buf, contentType } = await this.runner(job.body, job.abort.signal);
+          const { buf, contentType } = await this.runner(job, job.abort.signal);
           if (job.status === 'cancelled') continue; // 运行中被取消，丢弃结果
           job.resultBuf = buf;
           job.contentType = contentType || 'application/zip';

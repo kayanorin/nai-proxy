@@ -21,6 +21,8 @@ export function loadConfig(env = process.env) {
 
     // 总体限速：相邻请求「起点」最小间隔（默认 12s ≈ 5/分钟）
     minGapMs: numEnv(env.MIN_GAP_MS, 12000),
+    // vibe 编码任务的间隔（比生图轻很多，可以更密；仍走同一条串行队列）
+    encodeMinGapMs: numEnv(env.ENCODE_MIN_GAP_MS, 3000),
     // 结果保留时长，超时回收释放内存（默认 10 分钟）
     resultTtlMs: numEnv(env.RESULT_TTL_MS, 10 * 60 * 1000),
     // 内存里最多保留多少 job（含已完成），超出驱逐最旧的已结束 job
@@ -34,6 +36,8 @@ export function loadConfig(env = process.env) {
 
     // NAI 接口基址，默认真地址；测试时指向本地 mock
     naiBaseUrl: env.NAI_BASE_URL || 'https://image.novelai.net',
+    // NAI 账号接口基址（查 Anlas 余额用；与生图不是同一个域名）
+    naiApiBaseUrl: env.NAI_API_BASE_URL || 'https://api.novelai.net',
 
     // 429 / 网络错误重试参数（沿用客户端原来 10 次的思路）
     retry: {

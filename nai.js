@@ -1,12 +1,13 @@
 // nai.js — 向 NovelAI 转发请求，带 429 退避重试 + 友好错误映射。
-// 结果是 zip 二进制，按 Buffer 原样返回（绝不当文本解析）。
+// 结果是二进制（生图 zip / vibe 编码原始字节），按 Buffer 原样返回（绝不当文本解析）。
 
 /**
- * 调用 NAI 生图接口，带重试。
+ * 调用 NAI 接口，带重试。
  * @param {object} body  客户端拼好的 NAI 请求体（透传，服务端不重写 prompt/尺寸/vibe）
  * @param {object} opts
  * @param {string} opts.baseUrl   NAI 基址（默认真地址，测试指向 mock）
  * @param {string} opts.apiKey    NAI token（仅服务端持有）
+ * @param {string} [opts.path]    接口路径（默认生图；vibe 编码传 /ai/encode-vibe）
  * @param {AbortSignal} [opts.signal]
  * @param {number} [opts.maxRetries]
  * @param {number} [opts.retryBaseMs]
@@ -15,9 +16,20 @@
  */
 export async function callNAIWithRetry(
   body,
-  { baseUrl, apiKey, signal, maxRetries = 10, retryBaseMs = 3000, retryMaxMs = 30000 } = {}
+  {
+    baseUrl,
+    apiKey,
+    path = '/ai/generate-image',
+    signal,
+    maxRetries = 10,
+    retryBaseMs = 3000,
+    retryMaxMs = 30000,
+  } = {}
 ) {
-  const url = String(baseUrl).replace(/\/+$/, '') + '/ai/generate-image';
+  const url = String(baseUrl).replace(/\/+$/, '') + path;
+  // 生图回 zip，encode-vibe 回一段裸字节；缺 content-type 时按接口兜底
+  const defaultContentType =
+    path === '/ai/generate-image' ? 'application/zip' : 'application/octet-stream';
   let attempt = 0;
 
   while (true) {
@@ -50,7 +62,7 @@ export async function callNAIWithRetry(
 
     if (res.ok) {
       const buf = Buffer.from(await res.arrayBuffer());
-      const contentType = res.headers.get('content-type') || 'application/zip';
+      const contentType = res.headers.get('content-type') || defaultContentType;
       return { buf, contentType };
     }
 
@@ -74,6 +86,39 @@ export async function callNAIWithRetry(
 
     const text = await safeText(res);
     throw mkErr(`NAI 返回 ${res.status}${text ? '：' + text.slice(0, 300) : ''}`, 'NAI_' + res.status);
+  }
+}
+
+/**
+ * 查当前 Anlas 余额（GET /user/subscription，注意主机是 api.novelai.net 不是 image.）。
+ * 用于「任务前后取差值＝真实消耗」这条统计口径。
+ * 任何失败都返回 null 而不抛：余额查不到只是统计回落到估算，绝不能影响出图。
+ * @returns {Promise<number|null>}
+ */
+export async function fetchAnlasBalance({ baseUrl, apiKey, timeoutMs = 10000 } = {}) {
+  if (!baseUrl || !apiKey) return null;
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), timeoutMs);
+  try {
+    const res = await fetch(String(baseUrl).replace(/\/+$/, '') + '/user/subscription', {
+      headers: { Authorization: 'Bearer ' + apiKey, Accept: 'application/json' },
+      signal: ac.signal,
+    });
+    if (!res.ok) return null;
+    const j = await res.json();
+    const left = j?.trainingStepsLeft;
+    const fixed = Number(left?.fixedTrainingStepsLeft);
+    const purchased = Number(left?.purchasedTrainingSteps);
+    if (!Number.isFinite(fixed) && !Number.isFinite(purchased)) {
+      // 响应结构与预期不符：打出来供车主核对，本次按查不到处理
+      console.log(JSON.stringify({ evt: 'balance_shape_unexpected', body: j }));
+      return null;
+    }
+    return (Number.isFinite(fixed) ? fixed : 0) + (Number.isFinite(purchased) ? purchased : 0);
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
   }
 }
 

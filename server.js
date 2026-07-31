@@ -8,7 +8,7 @@ import express from 'express';
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
 import { JobQueue } from './queue.js';
-import { callNAIWithRetry } from './nai.js';
+import { callNAIWithRetry, fetchAnlasBalance } from './nai.js';
 import { estimateAnlas } from './anlas.js';
 import { UsageStats } from './stats.js';
 
@@ -33,34 +33,53 @@ export function createApp(config) {
   const stats = new UsageStats();
   app.set('stats', stats);
 
+  // 最近一次已知的 Anlas 余额（runner 每跑完一单顺手更新，/balance 优先读它，省得频繁打 NAI）
+  let _balCache = { balance: null, at: 0 };
+  const balanceOpts = { baseUrl: config.naiApiBaseUrl, apiKey: config.naiKey };
+
   const queue = new JobQueue({
     minGapMs: config.minGapMs,
+    encodeMinGapMs: config.encodeMinGapMs,
     resultTtlMs: config.resultTtlMs,
     maxJobs: config.maxJobs,
-    runner: (body, signal) =>
-      callNAIWithRetry(body, {
+    // 任务前后各查一次余额，差值＝这一单的真实扣点（队列串行，同一 key 上没有并发任务，
+    // 归因是准的）。查询失败就退回估算，不影响出图。
+    runner: async (job, signal) => {
+      const before = await fetchAnlasBalance(balanceOpts);
+      const out = await callNAIWithRetry(job.body, {
         baseUrl: config.naiBaseUrl,
         apiKey: config.naiKey,
+        path: job.kind === 'encode-vibe' ? '/ai/encode-vibe' : '/ai/generate-image',
         signal,
         ...config.retry,
-      }),
+      });
+      const after = await fetchAnlasBalance(balanceOpts);
+      if (after != null) _balCache = { balance: after, at: Date.now() };
+      if (before != null && after != null) job.anlasActual = Math.max(0, before - after);
+      return out;
+    },
     // 任务结束回调：只对成功(done)计点，并写一条结构化用量日志（车主看 Render 日志长期对账）
     onSettled: (job) => {
       if (job.status !== 'done') return;
-      const anlas = typeof job.anlasEst === 'number'
-        ? job.anlasEst
-        : estimateAnlas(job.body, { opus: config.opusFree });
+      const anlas =
+        typeof job.anlasActual === 'number'
+          ? job.anlasActual
+          : typeof job.anlasEst === 'number'
+            ? job.anlasEst
+            : estimateAnlas(job.body, { opus: config.opusFree });
       stats.record(job.token, anlas);
       const p = (job.body && job.body.parameters) || {};
       console.log(JSON.stringify({
         evt: 'usage',
         at: new Date().toISOString(),
         token: job.token,
+        kind: job.kind,
         model: job.body && job.body.model,
         size: `${p.width || '?'}x${p.height || '?'}`,
         steps: p.steps,
         samples: p.n_samples || 1,
         anlas,
+        actual: typeof job.anlasActual === 'number' ? job.anlasActual : null,
       }));
     },
   });
@@ -112,7 +131,7 @@ export function createApp(config) {
       return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     }
     clampBody(body, config);
-    const id = queue.submit(req.token, body);
+    const id = queue.submit(req.token, body, 'generate');
     const job = queue.get(id);
     // 估点一次存到 job 上：/status 复用、完成计入统计，三处同一个数
     job.anlasEst = estimateAnlas(body, { opus: config.opusFree });
@@ -136,10 +155,11 @@ export function createApp(config) {
       job_id: job.id,
       status: job.status,
       position,
-      eta_ms: etaMs(position, config.minGapMs),
+      eta_ms: etaMs(position, job.kind === 'encode-vibe' ? config.encodeMinGapMs : config.minGapMs),
       anlas_est: typeof job.anlasEst === 'number'
         ? job.anlasEst
         : estimateAnlas(job.body, { opus: config.opusFree }),
+      ...(typeof job.anlasActual === 'number' ? { anlas_actual: job.anlasActual } : {}),
       error: job.error,
       code: job.errorCode,
     });
@@ -156,7 +176,10 @@ export function createApp(config) {
         .json({ error: '任务尚未完成', status: job.status, code: job.errorCode || null });
     }
     res.set('Content-Type', job.contentType || 'application/zip');
-    res.set('Content-Disposition', 'attachment; filename="result.zip"');
+    // 只有 zip（生图结果）才当附件下载；vibe 编码结果是裸字节，前端直接读
+    if (/zip/i.test(job.contentType || 'application/zip')) {
+      res.set('Content-Disposition', 'attachment; filename="result.zip"');
+    }
     res.send(job.resultBuf);
   });
 
@@ -167,6 +190,48 @@ export function createApp(config) {
     if (job.token !== req.token) return forbidden(res);
     const ok = queue.cancel(job.id);
     res.json({ cancelled: ok, status: job.status });
+  });
+
+  // ---- 提交 vibe 编码任务 ----
+  // 与 /submit 同一条串行队列（共用限速 / 单一真 key / 用量统计），只是打 NAI 的 /ai/encode-vibe。
+  // 结果是一段裸字节（vibe encoding），照常 GET /status 轮询 + GET /result 取。
+  app.post('/encode-vibe', auth, (req, res) => {
+    const body = req.body;
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ error: 'body 必须是 NAI 请求的 JSON 对象', code: 'BAD_BODY' });
+    }
+    if (body.image == null || body.information_extracted == null || !body.model) {
+      return res
+        .status(400)
+        .json({ error: 'body 需要 image / information_extracted / model 三个字段', code: 'BAD_BODY' });
+    }
+    if (!config.naiKey) {
+      return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
+    }
+    const id = queue.submit(req.token, body, 'encode-vibe');
+    const job = queue.get(id);
+    job.anlasEst = 2; // NAI 每次 vibe 编码固定 2 Anlas
+    const position = queue.position(id);
+    res.json({
+      job_id: id,
+      status: 'queued',
+      position,
+      eta_ms: etaMs(position, config.encodeMinGapMs),
+      anlas_est: job.anlasEst,
+    });
+  });
+
+  // ---- 查 Anlas 余额（朋友端显示用）----
+  // 优先走缓存：每跑完一单 runner 都会顺手刷新，正常用不着额外打 NAI。
+  const BALANCE_TTL_MS = 60 * 1000;
+  app.get('/balance', auth, async (req, res) => {
+    if (!config.naiKey) return res.json({ balance: null, at: 0 });
+    if (_balCache.balance != null && Date.now() - _balCache.at < BALANCE_TTL_MS) {
+      return res.json({ balance: _balCache.balance, at: _balCache.at });
+    }
+    const balance = await fetchAnlasBalance(balanceOpts);
+    if (balance != null) _balCache = { balance, at: Date.now() };
+    res.json({ balance, at: _balCache.at });
   });
 
   // ---- NAI 原生兼容端点 ----
@@ -198,7 +263,7 @@ export function createApp(config) {
       return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     }
     clampBody(body, config);
-    const id = queue.submit(req.token, body);
+    const id = queue.submit(req.token, body, 'generate');
     const job = queue.get(id);
     job.anlasEst = estimateAnlas(body, { opus: config.opusFree }); // 与 /submit 同口径，完成时计入统计
 

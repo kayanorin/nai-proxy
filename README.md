@@ -32,6 +32,8 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `GET /status/:id` | 是 | `{status, position, error, code}`；status ∈ queued/running/done/failed/cancelled |
 | `GET /result/:id` | 是 | done 时回 `application/zip` 原始字节；未完成 409 |
 | `POST /cancel/:id` | 是 | 排队中直接移除；运行中 Abort 中断 |
+| `POST /encode-vibe` | 是 | 收 `{image, information_extracted, model}` → 入**同一队列** → NAI `/ai/encode-vibe`；`/result` 回原始字节（不是 zip）。固定计 2 Anlas |
+| `GET /balance` | 是 | 当前 Anlas 余额 `{balance, at}`；60 秒缓存（每跑完一单自动刷新），查不到回 `balance:null` |
 | `POST /ai/generate-image` | 是* | **NAI 原生兼容**：同步生图（入同一队列、阻塞等出图、原样回 zip/msgpack）。给只能填 NAI key 的第三方客户端用（如酒馆插件） |
 
 鉴权：网页端用请求头 `X-Access-Token: <你的令牌>`。任务与提交它的令牌绑定，他人令牌查不到（403）。
@@ -57,13 +59,23 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `NAI_KEY` | （空） | 共享 NAI token。**换 key = 改这里**（这就是「填 key 的位置」） |
 | `ACCESS_TOKENS` | （空） | 逗号分隔的访问令牌，一人一个 |
 | `MIN_GAP_MS` | `12000` | 总体限速：相邻请求起点最小间隔，≈ 5/分钟 |
+| `ENCODE_MIN_GAP_MS` | `3000` | vibe 编码任务的间隔（比生图轻，可以更密；仍走同一条串行队列） |
 | `RESULT_TTL_MS` | `600000` | 结果保留时长（10 分钟），超时回收 |
 | `MAX_SAMPLES` / `MAX_STEPS` | `0` | 参数上限，0=不限制 |
 | `NAI_BASE_URL` | NAI 真地址 | 测试时指向本地 mock |
+| `NAI_API_BASE_URL` | `https://api.novelai.net` | NAI 账号接口（查 Anlas 余额），与生图不同域名 |
 | `MAX_JOBS` | `200` | 内存里最多保留多少 job |
 | `PORT` | `3000` | Render 自动注入 |
 
 完整清单见 [.env.example](.env.example)。
+
+## 用量统计口径
+
+**记账以实测为准**：每个任务开跑前后各查一次 NAI 余额，差值就是这一单的真实扣点（队列串行，同一 key 上没有并发任务，归因是准的）。这样局部重绘、precise 参考、vibe 编码等一切计费项都自动算进去，也不会因 NAI 改价而失真。
+
+`anlas.js` 的估算公式只用于两处：提交时给出预估显示、余额查不到时的记账回落。它已对齐官网前端的算法（img2img/局部重绘按 `strength` 折算且单张最低 2 点；precise 参考每张 5 点 × 张数且 Opus 免费档不豁免；vibe 引用第 5 个起每个 +2）。
+
+> 注意：Opus 免费档内（≤1024×1024、≤28 步、单张）的生图与局部重绘本来就是 0 点，统计记 0 是对的，不是漏记。车主自己在 NAI 网页上与代理同时出图会污染差值——罕见，接受。
 
 ## 本地运行
 

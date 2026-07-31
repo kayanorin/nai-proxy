@@ -19,6 +19,9 @@ services:
         sync: false
       - key: MIN_GAP_MS
         value: "12000"
+      # vibe 编码任务的间隔（同一条串行队列，只是更密）
+      - key: ENCODE_MIN_GAP_MS
+        value: "3000"
       - key: RESULT_TTL_MS
         value: "600000"
       - key: MAX_SAMPLES
