@@ -17,13 +17,17 @@ export function estimateAnlas(body, { opus = true } = {}) {
   const area = width * height;
   if (!area || !steps) return 0;
 
-  const perSample = Math.ceil(
+  const base = Math.ceil(
     2951823174884865e-21 * area + 5.753298233447344e-7 * area * steps
   );
+  const strength = p.image ? (num(p.strength) || 1) : 1;
+  const perSample = Math.max(Math.ceil(base * strength), 2);
   const withinOpusFree = opus && area <= 1024 * 1024 && steps <= 28;
   // Opus 免费档免费覆盖单张；批量里多出的 (samples-1) 张按张计。非 Opus / 超规格：全部按张计。
   const billable = withinOpusFree ? Math.max(0, samples - 1) : samples;
-  return billable * perSample;
+  const directorN = Array.isArray(p.director_reference_images) ? p.director_reference_images.length : 0;
+  const vibeN = Array.isArray(p.reference_image_multiple_cached) ? p.reference_image_multiple_cached.length : 0;
+  return billable * perSample + 5 * directorN * samples + Math.max(0, vibeN - 4) * 2;
 }
 
 function num(v) {

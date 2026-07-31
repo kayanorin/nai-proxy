@@ -15,9 +15,9 @@
  */
 export async function callNAIWithRetry(
   body,
-  { baseUrl, apiKey, signal, maxRetries = 10, retryBaseMs = 3000, retryMaxMs = 30000 } = {}
+  { baseUrl, apiKey, signal, path = '/ai/generate-image', maxRetries = 10, retryBaseMs = 3000, retryMaxMs = 30000 } = {}
 ) {
-  const url = String(baseUrl).replace(/\/+$/, '') + '/ai/generate-image';
+  const url = String(baseUrl).replace(/\/+$/, '') + path;
   let attempt = 0;
 
   while (true) {
@@ -50,7 +50,7 @@ export async function callNAIWithRetry(
 
     if (res.ok) {
       const buf = Buffer.from(await res.arrayBuffer());
-      const contentType = res.headers.get('content-type') || 'application/zip';
+      const contentType = res.headers.get('content-type') || (path === '/ai/encode-vibe' ? 'application/octet-stream' : 'application/zip');
       return { buf, contentType };
     }
 
@@ -74,6 +74,24 @@ export async function callNAIWithRetry(
 
     const text = await safeText(res);
     throw mkErr(`NAI 返回 ${res.status}${text ? '：' + text.slice(0, 300) : ''}`, 'NAI_' + res.status);
+  }
+}
+
+export async function fetchAnlasBalance({ baseUrl, apiKey, signal } = {}) {
+  try {
+    const res = await fetch(String(baseUrl).replace(/\/+$/, '') + '/user/subscription', {
+      headers: { Authorization: 'Bearer ' + apiKey },
+      signal,
+    });
+    if (!res.ok) return null;
+    const data = await res.json();
+    const left = data?.trainingStepsLeft;
+    const fixed = Number(left?.fixedTrainingStepsLeft);
+    const purchased = Number(left?.purchasedTrainingSteps);
+    if (!Number.isFinite(fixed) && !Number.isFinite(purchased)) return null;
+    return (Number.isFinite(fixed) ? fixed : 0) + (Number.isFinite(purchased) ? purchased : 0);
+  } catch {
+    return null;
   }
 }
 

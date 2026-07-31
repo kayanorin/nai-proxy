@@ -8,10 +8,12 @@
     "start": "node server.js",
     "mock": "node test/mock-nai.js",
     "smoke": "node test/smoke.js",
+    "test:activity": "node test/activity.js",
+    "test": "npm run test:activity && npm run smoke",
     "smoke:real": "node test/smoke-real.js"
   },
   "engines": {
-    "node": ">=18"
+    "node": ">=24"
   },
   "dependencies": {
     "express": "^4.19.2"

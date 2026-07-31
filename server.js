@@ -8,9 +8,10 @@ import express from 'express';
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
 import { JobQueue } from './queue.js';
-import { callNAIWithRetry } from './nai.js';
+import { callNAIWithRetry, fetchAnlasBalance } from './nai.js';
 import { estimateAnlas } from './anlas.js';
 import { UsageStats } from './stats.js';
+import { ActivityStore } from './activity.js';
 
 export function createApp(config) {
   const app = express();
@@ -32,34 +33,65 @@ export function createApp(config) {
   // 按令牌累计用量（内存聚合；逐条账本走下面 onSettled 里的 stdout `usage` 日志）
   const stats = new UsageStats();
   app.set('stats', stats);
+  const activity = new ActivityStore({
+    dbPath: config.statsDbPath || ':memory:',
+    retentionDays: config.statsRetentionDays || 90,
+    accessTokens: config.accessTokens,
+    userProfiles: config.userProfiles || new Map(),
+  });
+  app.set('activityStore', activity);
+
+  let balanceCache = { balance: null, at: 0 };
+  const readBalance = (signal) => fetchAnlasBalance({
+    baseUrl: config.naiApiBaseUrl || config.naiBaseUrl,
+    apiKey: config.naiKey,
+    signal,
+  });
 
   const queue = new JobQueue({
     minGapMs: config.minGapMs,
+    maxGapMs: config.maxGapMs,
+    encodeMinGapMs: config.encodeMinGapMs,
+    random: config.random,
     resultTtlMs: config.resultTtlMs,
     maxJobs: config.maxJobs,
-    runner: (body, signal) =>
-      callNAIWithRetry(body, {
+    runner: async (job, signal) => {
+      const before = await readBalance(signal);
+      const result = await callNAIWithRetry(job.body, {
         baseUrl: config.naiBaseUrl,
         apiKey: config.naiKey,
         signal,
+        path: job.kind === 'encode-vibe' ? '/ai/encode-vibe' : '/ai/generate-image',
         ...config.retry,
-      }),
+      });
+      const after = await readBalance(signal);
+      if (typeof after === 'number') balanceCache = { balance: after, at: Date.now() };
+      if (typeof before === 'number' && typeof after === 'number') {
+        job.anlasActual = Math.max(0, before - after);
+      }
+      return result;
+    },
     // 任务结束回调：只对成功(done)计点，并写一条结构化用量日志（车主看 Render 日志长期对账）
     onSettled: (job) => {
       if (job.status !== 'done') return;
-      const anlas = typeof job.anlasEst === 'number'
-        ? job.anlasEst
-        : estimateAnlas(job.body, { opus: config.opusFree });
+      const anlas = typeof job.anlasActual === 'number'
+        ? job.anlasActual
+        : typeof job.anlasEst === 'number'
+          ? job.anlasEst
+          : estimateAnlas(job.body, { opus: config.opusFree });
       stats.record(job.token, anlas);
+      activity.record(job.token, { at: job.createdAt, kind: job.kind, anlas });
       const p = (job.body && job.body.parameters) || {};
+      const profile = activity.profileForToken(job.token);
       console.log(JSON.stringify({
         evt: 'usage',
         at: new Date().toISOString(),
-        token: job.token,
+        userId: profile?.id || 'unknown',
         model: job.body && job.body.model,
         size: `${p.width || '?'}x${p.height || '?'}`,
         steps: p.steps,
         samples: p.n_samples || 1,
+        kind: job.kind,
         anlas,
       }));
     },
@@ -112,7 +144,7 @@ export function createApp(config) {
       return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     }
     clampBody(body, config);
-    const id = queue.submit(req.token, body);
+    const id = queue.submit(req.token, body, 'generate');
     const job = queue.get(id);
     // 估点一次存到 job 上：/status 复用、完成计入统计，三处同一个数
     job.anlasEst = estimateAnlas(body, { opus: config.opusFree });
@@ -121,7 +153,7 @@ export function createApp(config) {
       job_id: id,
       status: 'queued',
       position,
-      eta_ms: etaMs(position, config.minGapMs),
+      eta_ms: etaMs(position, averageGapMs(config.minGapMs, config.maxGapMs)),
       anlas_est: job.anlasEst,
     });
   });
@@ -136,10 +168,11 @@ export function createApp(config) {
       job_id: job.id,
       status: job.status,
       position,
-      eta_ms: etaMs(position, config.minGapMs),
+      eta_ms: etaMs(position, averageGapMs(config.minGapMs, config.maxGapMs)),
       anlas_est: typeof job.anlasEst === 'number'
         ? job.anlasEst
         : estimateAnlas(job.body, { opus: config.opusFree }),
+      anlas_actual: typeof job.anlasActual === 'number' ? job.anlasActual : null,
       error: job.error,
       code: job.errorCode,
     });
@@ -156,7 +189,9 @@ export function createApp(config) {
         .json({ error: '任务尚未完成', status: job.status, code: job.errorCode || null });
     }
     res.set('Content-Type', job.contentType || 'application/zip');
-    res.set('Content-Disposition', 'attachment; filename="result.zip"');
+    if ((job.contentType || '').includes('zip')) {
+      res.set('Content-Disposition', 'attachment; filename="result.zip"');
+    }
     res.send(job.resultBuf);
   });
 
@@ -167,6 +202,31 @@ export function createApp(config) {
     if (job.token !== req.token) return forbidden(res);
     const ok = queue.cancel(job.id);
     res.json({ cancelled: ok, status: job.status });
+  });
+
+  // ---- Vibe 编码（同一串行队列，裸字节返回）----
+  app.post('/encode-vibe', auth, (req, res) => {
+    const body = req.body;
+    if (!config.naiKey) return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
+    if (!body || typeof body !== 'object' || !body.image || !body.information_extracted || !body.model) {
+      return res.status(400).json({ error: 'body 缺少 image / information_extracted / model', code: 'BAD_BODY' });
+    }
+    const id = queue.submit(req.token, body, 'encode-vibe');
+    const job = queue.get(id);
+    job.anlasEst = 2;
+    const position = queue.position(id);
+    res.json({ job_id: id, status: 'queued', position, eta_ms: etaMs(position, config.encodeMinGapMs), anlas_est: 2 });
+  });
+
+  // ---- 当前 Anlas 余额（60 秒缓存）----
+  app.get('/balance', auth, async (req, res) => {
+    if (!config.naiKey) return res.json({ balance: null, at: Date.now() });
+    if (typeof balanceCache.balance === 'number' && Date.now() - balanceCache.at < 60_000) {
+      return res.json(balanceCache);
+    }
+    const balance = await readBalance();
+    if (typeof balance === 'number') balanceCache = { balance, at: Date.now() };
+    res.json(typeof balance === 'number' ? balanceCache : { balance: null, at: Date.now() });
   });
 
   // ---- NAI 原生兼容端点 ----
@@ -198,7 +258,7 @@ export function createApp(config) {
       return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     }
     clampBody(body, config);
-    const id = queue.submit(req.token, body);
+    const id = queue.submit(req.token, body, 'generate');
     const job = queue.get(id);
     job.anlasEst = estimateAnlas(body, { opus: config.opusFree }); // 与 /submit 同口径，完成时计入统计
 
@@ -235,12 +295,35 @@ export function createApp(config) {
     next();
   };
   // { since, totals:{count,anlas}, tokens:{ <token>:{count,anlas,lastAt} } }
-  app.get('/stats', adminAuth, (req, res) => res.json(stats.snapshot()));
+  app.get('/stats', adminAuth, (req, res) => {
+    const snap = stats.snapshot();
+    for (const [token, entry] of Object.entries(snap.tokens)) Object.assign(entry, activity.profileForToken(token) || {});
+    res.json(snap);
+  });
+  app.get('/stats/me/activity', auth, (req, res) => {
+    const days = ActivityStore.validDays(req.query.days ?? 7);
+    if (!days) return res.status(400).json({ error: 'days 只支持 7 / 30 / 90', code: 'BAD_DAYS' });
+    const data = activity.querySelf(req.token, days);
+    if (!data) return res.status(404).json({ error: '未找到用户资料', code: 'NO_PROFILE' });
+    res.json(data);
+  });
+  app.get('/stats/activity', adminAuth, (req, res) => {
+    const days = ActivityStore.validDays(req.query.days ?? 7);
+    if (!days) return res.status(400).json({ error: 'days 只支持 7 / 30 / 90', code: 'BAD_DAYS' });
+    const data = activity.queryAdmin(days, String(req.query.user || 'all'));
+    if (!data) return res.status(400).json({ error: '未知用户', code: 'BAD_USER' });
+    res.json(data);
+  });
   // 按账期手动清零（不调也行——Render 免费档重启会自然清零）
   app.post('/stats/reset', adminAuth, (req, res) => {
     stats.reset();
+    activity.reset();
     res.json({ ok: true, since: stats.snapshot().since });
   });
+
+  // 用量统计的简易网页（车主用）：页面本身不含密钥，可公开加载；
+  // 进页面后填【管理员令牌】，前端用 X-Access-Token 头去打 /stats（令牌只留在浏览器 localStorage，不进 URL）。
+  app.get('/stats/ui', (req, res) => res.type('html').send(STATS_UI_HTML));
 
   // ---- 兜底：未匹配的路径打一条日志（便于确认第三方客户端实际打的路径），并 404 ----
   app.use((req, res) => {
@@ -280,6 +363,10 @@ function etaMs(position, gapMs) {
   return position != null && position > 0 ? position * gapMs : 0;
 }
 
+function averageGapMs(min, max) {
+  return Math.round((min + Math.max(min, max)) / 2);
+}
+
 // 可选的参数 clamp，防误操作烧 Anlas（0 = 不限制）
 function clampBody(body, config) {
   const p = body.parameters;
@@ -292,13 +379,142 @@ function clampBody(body, config) {
   }
 }
 
+// /stats/ui 的页面：纯静态、无密钥。填管理员令牌 → 前端带 X-Access-Token 头拉 /stats 渲染。
+const STATS_UI_HTML = `<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>nai-proxy 用量</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 -apple-system, system-ui, "Segoe UI", sans-serif; max-width: 820px; margin: 2rem auto; padding: 0 1rem; }
+  h1 { font-size: 1.3rem; margin: 0 0 .25rem; }
+  .muted { opacity: .65; font-size: .85rem; }
+  .bar { display: flex; gap: .5rem; align-items: center; flex-wrap: wrap; margin: 1rem 0; }
+  input, select { flex: 1; min-width: 140px; padding: .5rem .6rem; border: 1px solid #8886; border-radius: 8px; background: transparent; color: inherit; }
+  button { padding: .5rem .9rem; border: 1px solid #8886; border-radius: 8px; background: #8882; color: inherit; cursor: pointer; }
+  button:hover { background: #8883; }
+  button.danger { border-color: #e5484d88; color: #e5484d; }
+  .cards { display: flex; gap: 1rem; flex-wrap: wrap; margin: 1rem 0; }
+  .card { flex: 1; min-width: 140px; border: 1px solid #8883; border-radius: 12px; padding: .8rem 1rem; }
+  .card .n { font-size: 1.6rem; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; margin-top: .5rem; }
+  th, td { text-align: left; padding: .5rem .4rem; border-bottom: 1px solid #8882; }
+  th { font-size: .8rem; opacity: .7; font-weight: 600; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  code { word-break: break-all; font-size: .85em; }
+  #msg { color: #e5484d; font-size: .85rem; }
+  .hours { display:grid; grid-template-columns:repeat(12,1fr); gap:.35rem; margin:1rem 0; }
+  .hour { min-height:54px; display:grid; place-items:center; border-radius:8px; background:color-mix(in srgb,#0f766e calc(var(--heat)*100%),#8881); font-size:.72rem; text-align:center; }
+  @media(max-width:640px){.hours{grid-template-columns:repeat(6,1fr)}}
+</style>
+</head>
+<body>
+  <h1>nai-proxy 用量统计</h1>
+  <div class="muted" id="since">—</div>
+
+  <div class="bar">
+    <input id="tok" type="password" placeholder="管理员令牌 (ADMIN_TOKEN)" autocomplete="current-password">
+    <label class="muted"><input type="checkbox" id="remember" style="flex:none;min-width:auto"> 记住</label>
+    <button id="load">刷新</button>
+    <button id="reset" class="danger">清零账期</button>
+  </div>
+  <div class="bar">
+    <select id="days" aria-label="统计周期"><option value="7">最近 7 天</option><option value="30">最近 30 天</option><option value="90">最近 90 天</option></select>
+    <select id="user" aria-label="用户"><option value="all">所有用户（各自本地时间）</option></select>
+  </div>
+  <div id="msg"></div>
+
+  <div class="cards">
+    <div class="card"><div class="muted">总请求数</div><div class="n" id="tCount">—</div></div>
+    <div class="card"><div class="muted">总消耗 Anlas</div><div class="n" id="tAnlas">—</div></div>
+    <div class="card"><div class="muted">朋友数</div><div class="n" id="tUsers">—</div></div>
+  </div>
+  <div class="hours" id="hours"></div>
+
+  <table>
+    <thead><tr><th>访问令牌</th><th class="num">次数</th><th class="num">Anlas</th><th>最近一次</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  const KEY = 'nai_admin_token';
+  const saved = localStorage.getItem(KEY);
+  if (saved) { $('tok').value = saved; $('remember').checked = true; }
+
+  const fmtTime = (ms) => ms ? new Date(ms).toLocaleString() : '—';
+  const fmtNum = (n) => (n ?? 0).toLocaleString();
+
+  async function load() {
+    const tok = $('tok').value.trim();
+    $('msg').textContent = '';
+    if (!tok) { $('msg').textContent = '请先填管理员令牌'; return; }
+    if ($('remember').checked) localStorage.setItem(KEY, tok); else localStorage.removeItem(KEY);
+    let r;
+    let ar;
+    try {
+      [r, ar] = await Promise.all([
+        fetch('/stats', { headers: { 'X-Access-Token': tok } }),
+        fetch('/stats/activity?days=' + $('days').value + '&user=' + encodeURIComponent($('user').value), { headers: { 'X-Access-Token': tok } }),
+      ]);
+    }
+    catch (e) { $('msg').textContent = '网络错误：' + e.message; return; }
+    if (r.status === 401) { $('msg').textContent = '管理员令牌不对'; return; }
+    if (r.status === 404) { $('msg').textContent = 'stats 未启用（服务端未设 ADMIN_TOKEN）'; return; }
+    if (!r.ok) { $('msg').textContent = '出错：HTTP ' + r.status; return; }
+    if (!ar.ok) { $('msg').textContent = '活动统计出错：HTTP ' + ar.status; return; }
+    render(await r.json(), await ar.json());
+  }
+
+  function render(d, a) {
+    $('since').textContent = '账期起点：' + fmtTime(d.since);
+    $('tCount').textContent = fmtNum(d.totals.count);
+    $('tAnlas').textContent = fmtNum(d.totals.anlas);
+    const entries = Object.entries(d.tokens).sort((a, b) => b[1].anlas - a[1].anlas);
+    $('tUsers').textContent = entries.length;
+    const selected = $('user').value;
+    $('user').innerHTML = '<option value="all">所有用户（各自本地时间）</option>' + (a.users || []).map(u => '<option value="' + u.id + '">' + u.name.replace(/[<&]/g, c => c === '<' ? '&lt;' : '&amp;') + ' · ' + u.timeZone + '</option>').join('');
+    if ([...$('user').options].some(o => o.value === selected)) $('user').value = selected;
+    const max = Math.max(0, ...a.hours.map(h => h.count || 0));
+    $('hours').innerHTML = a.hours.map(h => {
+      const heat = h.count && max ? .2 + .8 * Math.sqrt(h.count / max) : 0;
+      return '<div class="hour" style="--heat:' + heat + '"><span>' + String(h.hour).padStart(2,'0') + ':00</span><strong>' + h.count + '</strong></div>';
+    }).join('');
+    $('rows').innerHTML = entries.map(([t, e]) =>
+      '<tr><td><code>' + (e.name || ('…' + t.slice(-6))).replace(/[<&]/g, c => c === '<' ? '&lt;' : '&amp;') + '</code></td>' +
+      '<td class="num">' + fmtNum(e.count) + '</td>' +
+      '<td class="num">' + fmtNum(e.anlas) + '</td>' +
+      '<td>' + fmtTime(e.lastAt) + '</td></tr>'
+    ).join('') || '<tr><td colspan="4" class="muted">暂无数据</td></tr>';
+  }
+
+  async function reset() {
+    const tok = $('tok').value.trim();
+    if (!tok) { $('msg').textContent = '请先填管理员令牌'; return; }
+    if (!confirm('确定清零当前账期的统计？（逐条账本仍在服务器日志里）')) return;
+    const r = await fetch('/stats/reset', { method: 'POST', headers: { 'X-Access-Token': tok } });
+    if (r.ok) load(); else $('msg').textContent = '清零失败：HTTP ' + r.status;
+  }
+
+  $('load').onclick = load;
+  $('reset').onclick = reset;
+  $('days').onchange = load;
+  $('user').onchange = load;
+  $('tok').addEventListener('keydown', (e) => { if (e.key === 'Enter') load(); });
+  if (saved) load();
+</script>
+</body>
+</html>`;
+
 // ---- 直接运行时启动服务 ----
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const config = loadConfig();
   const app = createApp(config);
   app.listen(config.port, () => {
     console.log(
-      `[nai-proxy] 监听 :${config.port}  串行间隔=${config.minGapMs}ms  ` +
+      `[nai-proxy] 监听 :${config.port}  生图间隔=${config.minGapMs}–${config.maxGapMs}ms  ` +
         `令牌数=${config.accessTokens.size}  NAI=${config.naiBaseUrl}`
     );
     if (!config.naiKey) console.warn('[nai-proxy] ⚠ 未配置 NAI_KEY，/submit 会拒绝');

@@ -1,7 +1,7 @@
 // queue.js — 内存任务队列 + 单 worker 串行执行 + TTL 回收。
 //
 // 防 429/风控的主防线是「串行到 1」：任意时刻最多一个请求在飞。
-// MIN_GAP_MS 是额外的总体限速（相邻请求起点间隔）。
+// MIN_GAP_MS / MAX_GAP_MS 定义生图请求起点的随机间隔范围。
 
 import { randomUUID } from 'node:crypto';
 
@@ -10,13 +10,17 @@ export class JobQueue {
    * @param {object} opts
    * @param {(body:object, signal:AbortSignal)=>Promise<{buf:Buffer,contentType:string}>} opts.runner
    * @param {number} [opts.minGapMs]
+   * @param {number} [opts.maxGapMs]
    * @param {number} [opts.resultTtlMs]
    * @param {number} [opts.maxJobs]
    */
-  constructor({ runner, onSettled = null, minGapMs = 12000, resultTtlMs = 600000, maxJobs = 200 }) {
+  constructor({ runner, onSettled = null, minGapMs = 8000, maxGapMs = 12000, encodeMinGapMs = 3000, random = Math.random, resultTtlMs = 600000, maxJobs = 200 }) {
     this.runner = runner;
     this.onSettled = onSettled;
     this.minGapMs = minGapMs;
+    this.maxGapMs = Math.max(minGapMs, maxGapMs);
+    this.encodeMinGapMs = encodeMinGapMs;
+    this.random = random;
     this.resultTtlMs = resultTtlMs;
     this.maxJobs = maxJobs;
 
@@ -29,12 +33,13 @@ export class JobQueue {
     this._reaper = null;
   }
 
-  submit(token, body) {
+  submit(token, body, kind = 'generate') {
     const id = randomUUID();
     const job = {
       id,
       token,
       body,
+      kind,
       status: 'queued', // queued | running | done | failed | cancelled
       resultBuf: null,
       contentType: null,
@@ -121,8 +126,9 @@ export class JobQueue {
           continue;
         }
 
-        // 限速：与上次请求起点间隔 ≥ minGapMs
-        const wait = this.minGapMs - (Date.now() - this.lastStartAt);
+        // 生图任务每次独立抽取间隔；Vibe 编码保留自己的固定间隔。
+        const gapMs = job.kind === 'encode-vibe' ? this.encodeMinGapMs : this._nextGenerateGapMs();
+        const wait = gapMs - (Date.now() - this.lastStartAt);
         if (wait > 0) await sleep(wait);
 
         // 等待期间可能被取消
@@ -138,7 +144,7 @@ export class JobQueue {
         this.lastStartAt = Date.now();
 
         try {
-          const { buf, contentType } = await this.runner(job.body, job.abort.signal);
+          const { buf, contentType } = await this.runner(job, job.abort.signal);
           if (job.status === 'cancelled') continue; // 运行中被取消，丢弃结果
           job.resultBuf = buf;
           job.contentType = contentType || 'application/zip';
@@ -156,6 +162,12 @@ export class JobQueue {
     } finally {
       this.working = false;
     }
+  }
+
+  _nextGenerateGapMs() {
+    if (this.maxGapMs <= this.minGapMs) return this.minGapMs;
+    const unit = Math.max(0, Math.min(0.999999999, Number(this.random()) || 0));
+    return this.minGapMs + Math.floor(unit * (this.maxGapMs - this.minGapMs + 1));
   }
 
   // 统一收尾：跑 onSettled 回调 + 兑现所有 waitFor。

@@ -1,0 +1,35 @@
+# systemd 单元 —— 让 node server.js 常驻、崩溃自动重启、开机自启。
+# 安装：sudo cp deploy/nai-proxy.service /etc/systemd/system/
+#       sudo systemctl daemon-reload && sudo systemctl enable --now nai-proxy
+#
+# 假设：代码在 /opt/nai-proxy，用户 ubuntu，node 在 PATH 里（nvm 装的话见下方注释）。
+
+[Unit]
+Description=nai-proxy (NovelAI 拼车分发服务)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/opt/nai-proxy
+EnvironmentFile=/etc/nai-proxy.env
+
+# 若 node 是用 nvm 装的，把下面换成绝对路径，例如：
+#   ExecStart=/home/ubuntu/.nvm/versions/node/v24.x.x/bin/node server.js
+# 用 apt/nodesource 装的话 /usr/bin/node 即可。
+ExecStart=/usr/bin/node server.js
+
+Restart=always
+RestartSec=3
+
+# 崩溃循环时别无限狂重启：10 秒内起超过 5 次就停 30 秒
+StartLimitIntervalSec=10
+StartLimitBurst=5
+
+# 轻量加固
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
