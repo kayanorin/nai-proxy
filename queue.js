@@ -1,7 +1,7 @@
 // queue.js — 内存任务队列 + 单 worker 串行执行 + TTL 回收。
 //
 // 防 429/风控的主防线是「串行到 1」：任意时刻最多一个请求在飞。
-// MIN_GAP_MS 是额外的总体限速（相邻请求起点间隔）。
+// MIN_GAP_MS / MAX_GAP_MS 定义生图请求起点的随机间隔范围。
 
 import { randomUUID } from 'node:crypto';
 
@@ -10,22 +10,28 @@ export class JobQueue {
    * @param {object} opts
    * @param {(job:object, signal:AbortSignal)=>Promise<{buf:Buffer,contentType:string}>} opts.runner
    * @param {number} [opts.minGapMs]
+   * @param {number} [opts.maxGapMs]        生图间隔上界；每单在 [minGapMs, maxGapMs] 内独立抽取
    * @param {number} [opts.encodeMinGapMs]  vibe 编码任务的间隔（比生图便宜快，可以更密）
+   * @param {number} [opts.random]          取随机数的函数，测试里可注入固定值
    * @param {number} [opts.resultTtlMs]
    * @param {number} [opts.maxJobs]
    */
   constructor({
     runner,
     onSettled = null,
-    minGapMs = 12000,
+    minGapMs = 8000,
+    maxGapMs = 12000,
     encodeMinGapMs = null,
+    random = Math.random,
     resultTtlMs = 600000,
     maxJobs = 200,
   }) {
     this.runner = runner;
     this.onSettled = onSettled;
     this.minGapMs = minGapMs;
+    this.maxGapMs = Math.max(minGapMs, maxGapMs);
     this.encodeMinGapMs = encodeMinGapMs;
+    this.random = random;
     this.resultTtlMs = resultTtlMs;
     this.maxJobs = maxJobs;
 
@@ -133,11 +139,12 @@ export class JobQueue {
           continue;
         }
 
-        // 限速：与上次请求起点间隔 ≥ 该类型的最小间隔
+        // 限速：与上次请求起点间隔 ≥ 该类型的最小间隔。
+        // 生图每单在 [minGapMs, maxGapMs] 内独立抽取；vibe 编码用自己的固定间隔。
         const gap =
           job.kind === 'encode-vibe' && this.encodeMinGapMs != null
             ? this.encodeMinGapMs
-            : this.minGapMs;
+            : this._nextGenerateGapMs();
         const wait = gap - (Date.now() - this.lastStartAt);
         if (wait > 0) await sleep(wait);
 
@@ -172,6 +179,12 @@ export class JobQueue {
     } finally {
       this.working = false;
     }
+  }
+
+  _nextGenerateGapMs() {
+    if (this.maxGapMs <= this.minGapMs) return this.minGapMs;
+    const unit = Math.max(0, Math.min(0.999999999, Number(this.random()) || 0));
+    return this.minGapMs + Math.floor(unit * (this.maxGapMs - this.minGapMs + 1));
   }
 
   // 统一收尾：跑 onSettled 回调 + 兑现所有 waitFor。

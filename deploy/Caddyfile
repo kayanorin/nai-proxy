@@ -1,0 +1,24 @@
+# Caddy 反向代理 —— 自动申请 + 自动续期 HTTPS 证书，转发到本地 node。
+# 前提：你有个域名，并把它的 A 记录指向这台 VM 的【保留公网 IP】。
+# 安装位置：/etc/caddy/Caddyfile  然后 sudo systemctl restart caddy
+#
+# 把 nai.example.com 换成你的真域名，邮箱换成你的（证书到期提醒用）。
+
+nai.example.com {
+	encode gzip
+	reverse_proxy localhost:3000
+
+	# 让上游拿到真实客户端信息（这个 app 不依赖，但留着无害）
+	header_up X-Forwarded-For {remote_host}
+}
+
+# 全局设置：证书相关通知邮箱
+{
+	email you@example.com
+}
+
+# ------------------------------------------------------------------
+# 没有域名时的临时方案（不推荐长期用）：
+# Caddy 无法给裸 IP 签公网证书。要么忍受 http（令牌明文，风险），
+# 要么用 Caddy 自签证书让浏览器点「继续访问」。强烈建议弄个域名。
+# 免费域名可用 DuckDNS（xxx.duckdns.org），配好 A 记录后上面照填即可。

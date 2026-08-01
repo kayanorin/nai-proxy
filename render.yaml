@@ -18,6 +18,8 @@ services:
       - key: ACCESS_TOKENS
         sync: false
       - key: MIN_GAP_MS
+        value: "8000"
+      - key: MAX_GAP_MS
         value: "12000"
       # vibe 编码任务的间隔（同一条串行队列，只是更密）
       - key: ENCODE_MIN_GAP_MS

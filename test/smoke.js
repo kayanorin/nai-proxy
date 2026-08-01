@@ -43,7 +43,9 @@ function cfg(over = {}) {
     accessTokens: new Set(['tok1', 'tok2']),
     port: 0,
     minGapMs: 50,
+    maxGapMs: 50,
     encodeMinGapMs: 10,
+    random: () => 0,
     resultTtlMs: 600000,
     maxJobs: 200,
     reapIntervalMs: 60000,
@@ -54,6 +56,13 @@ function cfg(over = {}) {
     retry: { maxRetries: 5, retryBaseMs: 30, retryMaxMs: 120 },
     bodyLimit: '12mb',
     adminToken: 'admin',
+    opusFree: true,
+    statsDbPath: ':memory:',
+    statsRetentionDays: 90,
+    userProfiles: new Map([
+      ['tok1', { name: 'Alice', timeZone: 'America/Los_Angeles' }],
+      ['tok2', { name: 'Bob', timeZone: 'Asia/Shanghai' }],
+    ]),
     ...over,
   };
 }
@@ -216,8 +225,8 @@ await test('串行：任意时刻最多 1 个在飞', () =>
     assert(!s.concurrencyViolation, '不应出现并发重叠');
   }));
 
-await test('限速：相邻请求起点间隔 ≥ MIN_GAP_MS', () =>
-  withProxy({ minGapMs: 300 }, async ({ base }) => {
+await test('随机限速：相邻请求起点落在 MIN/MAX_GAP_MS 范围', () =>
+  withProxy({ minGapMs: 200, maxGapMs: 400, random: () => 0.5 }, async ({ base }) => {
     await drainAndReset();
     const ids = [];
     for (let i = 0; i < 3; i++) ids.push(await submitId(base, naiBody('gap_' + i)));
@@ -226,7 +235,8 @@ await test('限速：相邻请求起点间隔 ≥ MIN_GAP_MS', () =>
     const t = s.callTimes.slice().sort((a, b) => a - b);
     for (let i = 1; i < t.length; i++) {
       const d = t[i] - t[i - 1];
-      assert(d >= 300 - 60, `相邻间隔应 ≥300ms，实际 ${d}ms`);
+      assert(d >= 300 - 60, `相邻间隔应接近 300ms 且不低于容差，实际 ${d}ms`);
+      assert(d <= 300 + 100, `相邻间隔不应超过随机目标过多，实际 ${d}ms`);
     }
   }));
 
@@ -238,6 +248,8 @@ await test('429 退避重试后成功', () =>
     assert(j.status === 'done', `429 重试后应 done，实际 ${j.status} ${j.error || ''}`);
     const s = await mockStats();
     assert(s.calls >= 3, `应 ≥3 次调用（2×429 + 1 成功），实际 ${s.calls}`);
+    const activity = await (await fetch(base + '/stats/me/activity?days=7', { headers: { 'X-Access-Token': 'tok1' } })).json();
+    assert(activity.totals.requests === 1, `重试只应计一次，实际 ${activity.totals.requests}`);
   }));
 
 await test('401 → 任务 failed + KEY_INVALID', () =>
@@ -246,6 +258,8 @@ await test('401 → 任务 failed + KEY_INVALID', () =>
     const j = await waitJob(base, id);
     assert(j.status === 'failed', `应 failed，实际 ${j.status}`);
     assert(j.code === 'KEY_INVALID', `应 KEY_INVALID，实际 ${j.code}`);
+    const activity = await (await fetch(base + '/stats/me/activity?days=7', { headers: { 'X-Access-Token': 'tok1' } })).json();
+    assert(activity.totals.requests === 0, '失败任务不应计活动');
   }));
 
 await test('未完成取结果 → 409', () =>
@@ -269,6 +283,8 @@ await test('取消排队中的任务', () =>
     const s2 = await (await statusReq(base, id2)).json();
     assert(s2.status === 'cancelled', `应 cancelled，实际 ${s2.status}`);
     await waitJob(base, id1); // 排空运行中的 id1
+    const activity = await (await fetch(base + '/stats/me/activity?days=7', { headers: { 'X-Access-Token': 'tok1' } })).json();
+    assert(activity.totals.requests === 1, `取消任务不应计活动，实际 ${activity.totals.requests}`);
   }));
 
 await test('TTL 回收：超时后 job 404', () =>
@@ -279,6 +295,44 @@ await test('TTL 回收：超时后 job 404', () =>
     queue._reap();
     const r = await statusReq(base, id);
     assert(r.status === 404, `TTL 回收后应 404，实际 ${r.status}`);
+  }));
+
+await test('活动 self API：只返回本人 24 小时数据', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    await drainAndReset();
+    const id = await submitId(base, naiBody('activity-self', { width: 1024, height: 1024 }), 'tok1');
+    await waitJob(base, id, 'tok1');
+    const r = await fetch(base + '/stats/me/activity?days=7', { headers: { 'X-Access-Token': 'tok1' } });
+    const data = await r.json();
+    assert(r.status === 200, `应 200，实际 ${r.status}`);
+    assert(data.scope.name === 'Alice', `应是 Alice，实际 ${data.scope.name}`);
+    assert(data.scope.timeZone === 'America/Los_Angeles', '应返回配置时区');
+    assert(data.hours.length === 24, '应固定返回 24 小时');
+    assert(data.totals.requests === 1, `应 1 次，实际 ${data.totals.requests}`);
+    assert(!JSON.stringify(data).includes('tok1'), '响应不应泄露原始令牌');
+  }));
+
+await test('活动 admin API：聚合、参数校验与 reset', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    await drainAndReset();
+    const a = await submitId(base, naiBody('admin-a', { width: 1024, height: 1024 }), 'tok1');
+    const b = await submitId(base, naiBody('admin-b', { width: 1024, height: 1024 }), 'tok2');
+    await waitJob(base, a, 'tok1');
+    await waitJob(base, b, 'tok2');
+    const headers = { 'X-Access-Token': 'admin' };
+    assert((await fetch(base + '/stats/activity?days=7', { headers: { 'X-Access-Token': 'nope' } })).status === 401, '错管理员令牌应 401');
+    assert((await fetch(base + '/stats/me/activity?days=7', { headers: { 'X-Access-Token': 'nope' } })).status === 401, '错用户令牌应 401');
+    const all = await (await fetch(base + '/stats/activity?days=7&user=all', { headers })).json();
+    assert(all.totals.requests === 2, `聚合应 2 次，实际 ${all.totals.requests}`);
+    assert(all.users.length === 2, '管理员应拿到用户选择列表');
+    const aliceId = all.users.find((u) => u.name === 'Alice')?.id;
+    const alice = await (await fetch(base + `/stats/activity?days=7&user=${aliceId}`, { headers })).json();
+    assert(alice.scope.name === 'Alice' && alice.totals.requests === 1, '管理员单用户查询应只返回 Alice');
+    assert((await fetch(base + '/stats/activity?days=8', { headers })).status === 400, '非法 days 应 400');
+    assert((await fetch(base + '/stats/activity?days=7&user=missing', { headers })).status === 400, '未知用户应 400');
+    await fetch(base + '/stats/reset', { method: 'POST', headers });
+    const empty = await (await fetch(base + '/stats/activity?days=7&user=all', { headers })).json();
+    assert(empty.totals.requests === 0, 'reset 后活动历史应清空');
   }));
 
 await test('vibe 编码：提交 → 轮询 → 取裸字节，计 2 Anlas', () =>

@@ -34,6 +34,9 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `POST /cancel/:id` | 是 | 排队中直接移除；运行中 Abort 中断 |
 | `POST /encode-vibe` | 是 | 收 `{image, information_extracted, model}` → 入**同一队列** → NAI `/ai/encode-vibe`；`/result` 回原始字节（不是 zip）。固定计 2 Anlas |
 | `GET /balance` | 是 | 当前 Anlas 余额 `{balance, at}`；60 秒缓存（每跑完一单自动刷新），查不到回 `balance:null` |
+| `GET /stats/me/activity?days=7` | 是 | 当前令牌自己的 7/30/90 天本地小时活动，不返回其他用户 |
+| `GET /stats/activity?days=7&user=all` | 管理员 | 全体或单用户活动；`X-Access-Token` 使用 `ADMIN_TOKEN` |
+| `GET /stats/ui` | 页面公开，数据需管理员 | 车主活动统计页面；管理员令牌只保存在浏览器本地 |
 | `POST /ai/generate-image` | 是* | **NAI 原生兼容**：同步生图（入同一队列、阻塞等出图、原样回 zip/msgpack）。给只能填 NAI key 的第三方客户端用（如酒馆插件） |
 
 鉴权：网页端用请求头 `X-Access-Token: <你的令牌>`。任务与提交它的令牌绑定，他人令牌查不到（403）。
@@ -58,7 +61,8 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 |---|---|---|
 | `NAI_KEY` | （空） | 共享 NAI token。**换 key = 改这里**（这就是「填 key 的位置」） |
 | `ACCESS_TOKENS` | （空） | 逗号分隔的访问令牌，一人一个 |
-| `MIN_GAP_MS` | `12000` | 总体限速：相邻请求起点最小间隔，≈ 5/分钟 |
+| `MIN_GAP_MS` | `8000` | 生图请求随机起点间隔的下限 |
+| `MAX_GAP_MS` | `12000` | 生图请求随机起点间隔的上限（每单在上下限之间独立抽取） |
 | `ENCODE_MIN_GAP_MS` | `3000` | vibe 编码任务的间隔（比生图轻，可以更密；仍走同一条串行队列） |
 | `RESULT_TTL_MS` | `600000` | 结果保留时长（10 分钟），超时回收 |
 | `MAX_SAMPLES` / `MAX_STEPS` | `0` | 参数上限，0=不限制 |
@@ -66,6 +70,9 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `NAI_API_BASE_URL` | `https://api.novelai.net` | NAI 账号接口（查 Anlas 余额），与生图不同域名 |
 | `MAX_JOBS` | `200` | 内存里最多保留多少 job |
 | `PORT` | `3000` | Render 自动注入 |
+| `STATS_DB_PATH` | `./data/stats.sqlite` | 活动小时聚合 SQLite 路径；Oracle 推荐 `/var/lib/nai-proxy/stats.sqlite` |
+| `STATS_RETENTION_DAYS` | `90` | 活动历史保留天数 |
+| `USER_PROFILES_JSON` | `{}` | 访问令牌到显示名与 IANA 时区的 JSON 映射 |
 
 完整清单见 [.env.example](.env.example)。
 
@@ -90,7 +97,7 @@ NAI_KEY=你的key ACCESS_TOKENS=tok1 node server.js
 npm run smoke   # 若 npm 脚本找不到 node，直接：node test/smoke.js
 ```
 
-`npm run smoke` 会拉起一个假 NAI（[test/mock-nai.js](test/mock-nai.js)）+ 代理，断言：令牌拒绝 / 提交→轮询→取 zip / 任务绑定令牌 / 串行不并发 / 限速间隔 / 429 重试后成功 / 401→key 失效 / 未完成 409 / 取消 / TTL 回收。
+`npm test` 会先跑 19 项 mock 冒烟，再跑 SQLite 活动测试。覆盖令牌隔离、生成与 Vibe 编码、实际 Anlas 与估算回退、活动 API、重试/失败/取消不重复计数，以及持久化、时区/DST、清零和数据库隐私。
 
 ## 部署到 Render
 

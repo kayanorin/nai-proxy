@@ -9,18 +9,23 @@ export function loadConfig(env = process.env) {
       .map((s) => s.trim())
       .filter(Boolean)
   );
+  const userProfiles = parseUserProfiles(env.USER_PROFILES_JSON, accessTokens);
+  const minGapMs = numEnv(env.MIN_GAP_MS, 8000);
+  const maxGapMs = Math.max(minGapMs, numEnv(env.MAX_GAP_MS, 12000));
 
   return {
     // 共享 NAI token —— 换 key 就改这个环境变量（Render 上改了会自动重部署）
     naiKey: env.NAI_KEY || '',
     // 逗号分隔的访问令牌，一人一个、方便单独吊销
     accessTokens,
+    userProfiles,
 
     // Render 会注入 PORT
     port: numEnv(env.PORT, 3000),
 
-    // 总体限速：相邻请求「起点」最小间隔（默认 12s ≈ 5/分钟）
-    minGapMs: numEnv(env.MIN_GAP_MS, 12000),
+    // 总体限速：每个生图任务独立抽取相邻请求「起点」间隔（默认 8–12s）
+    minGapMs,
+    maxGapMs,
     // vibe 编码任务的间隔（比生图轻很多，可以更密；仍走同一条串行队列）
     encodeMinGapMs: numEnv(env.ENCODE_MIN_GAP_MS, 3000),
     // 结果保留时长，超时回收释放内存（默认 10 分钟）
@@ -52,7 +57,36 @@ export function loadConfig(env = process.env) {
     // 用量统计 / 管理端
     adminToken: env.ADMIN_TOKEN || '',     // 设了才开 /stats、/stats/reset（车主专用）
     opusFree: env.OPUS_FREE !== 'false',   // Anlas 估算是否按 Opus 免费档（默认 true）
+    statsDbPath: env.STATS_DB_PATH || './data/stats.sqlite',
+    statsRetentionDays: numEnv(env.STATS_RETENTION_DAYS, 90),
   };
+}
+
+function parseUserProfiles(raw, accessTokens) {
+  const profiles = new Map();
+  if (!raw) return profiles;
+  let value;
+  try {
+    value = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('USER_PROFILES_JSON 不是合法 JSON：' + e.message);
+  }
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('USER_PROFILES_JSON 必须是以访问令牌为 key 的对象');
+  }
+  const names = new Set();
+  for (const [token, profile] of Object.entries(value)) {
+    if (!accessTokens.has(token)) throw new Error('USER_PROFILES_JSON 包含不在 ACCESS_TOKENS 中的令牌');
+    const name = typeof profile?.name === 'string' ? profile.name.trim() : '';
+    const timeZone = typeof profile?.timeZone === 'string' ? profile.timeZone.trim() : '';
+    if (!name || !timeZone) throw new Error('USER_PROFILES_JSON 每项都需要 name 和 timeZone');
+    if (names.has(name)) throw new Error(`USER_PROFILES_JSON 用户名重复：${name}`);
+    try { new Intl.DateTimeFormat('en-US', { timeZone }).format(); }
+    catch { throw new Error(`USER_PROFILES_JSON 时区无效：${timeZone}`); }
+    names.add(name);
+    profiles.set(token, { name, timeZone });
+  }
+  return profiles;
 }
 
 function numEnv(v, dflt) {

@@ -1,5 +1,11 @@
 node_modules/
 .env
+/nai-proxy.env
+/data/
+/.deploy-backups/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
 *.zip
 result-real.png
 .DS_Store
