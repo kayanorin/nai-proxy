@@ -41,12 +41,9 @@ export function createApp(config) {
   });
   app.set('activityStore', activity);
 
-  let balanceCache = { balance: null, at: 0 };
-  const readBalance = (signal) => fetchAnlasBalance({
-    baseUrl: config.naiApiBaseUrl || config.naiBaseUrl,
-    apiKey: config.naiKey,
-    signal,
-  });
+  // 最近一次已知的 Anlas 余额（runner 每跑完一单顺手更新，/balance 优先读它，省得频繁打 NAI）
+  let _balCache = { balance: null, at: 0 };
+  const balanceOpts = { baseUrl: config.naiApiBaseUrl, apiKey: config.naiKey };
 
   const queue = new JobQueue({
     minGapMs: config.minGapMs,
@@ -55,30 +52,31 @@ export function createApp(config) {
     random: config.random,
     resultTtlMs: config.resultTtlMs,
     maxJobs: config.maxJobs,
+    // 任务前后各查一次余额，差值＝这一单的真实扣点（队列串行，同一 key 上没有并发任务，
+    // 归因是准的）。查询失败就退回估算，不影响出图。
     runner: async (job, signal) => {
-      const before = await readBalance(signal);
-      const result = await callNAIWithRetry(job.body, {
+      const before = await fetchAnlasBalance(balanceOpts);
+      const out = await callNAIWithRetry(job.body, {
         baseUrl: config.naiBaseUrl,
         apiKey: config.naiKey,
-        signal,
         path: job.kind === 'encode-vibe' ? '/ai/encode-vibe' : '/ai/generate-image',
+        signal,
         ...config.retry,
       });
-      const after = await readBalance(signal);
-      if (typeof after === 'number') balanceCache = { balance: after, at: Date.now() };
-      if (typeof before === 'number' && typeof after === 'number') {
-        job.anlasActual = Math.max(0, before - after);
-      }
-      return result;
+      const after = await fetchAnlasBalance(balanceOpts);
+      if (after != null) _balCache = { balance: after, at: Date.now() };
+      if (before != null && after != null) job.anlasActual = Math.max(0, before - after);
+      return out;
     },
     // 任务结束回调：只对成功(done)计点，并写一条结构化用量日志（车主看 Render 日志长期对账）
     onSettled: (job) => {
       if (job.status !== 'done') return;
-      const anlas = typeof job.anlasActual === 'number'
-        ? job.anlasActual
-        : typeof job.anlasEst === 'number'
-          ? job.anlasEst
-          : estimateAnlas(job.body, { opus: config.opusFree });
+      const anlas =
+        typeof job.anlasActual === 'number'
+          ? job.anlasActual
+          : typeof job.anlasEst === 'number'
+            ? job.anlasEst
+            : estimateAnlas(job.body, { opus: config.opusFree });
       stats.record(job.token, anlas);
       activity.record(job.token, { at: job.createdAt, kind: job.kind, anlas });
       const p = (job.body && job.body.parameters) || {};
@@ -86,6 +84,7 @@ export function createApp(config) {
       console.log(JSON.stringify({
         evt: 'usage',
         at: new Date().toISOString(),
+        // 记稳定的 userId 而不是原始访问令牌：日志会长期留在 Render 上，别把令牌写进去
         userId: profile?.id || 'unknown',
         model: job.body && job.body.model,
         size: `${p.width || '?'}x${p.height || '?'}`,
@@ -93,6 +92,7 @@ export function createApp(config) {
         samples: p.n_samples || 1,
         kind: job.kind,
         anlas,
+        actual: typeof job.anlasActual === 'number' ? job.anlasActual : null,
       }));
     },
   });
@@ -168,11 +168,17 @@ export function createApp(config) {
       job_id: job.id,
       status: job.status,
       position,
-      eta_ms: etaMs(position, averageGapMs(config.minGapMs, config.maxGapMs)),
+      // 生图的间隔是随机的，预估用区间均值；vibe 编码走自己那档固定间隔
+      eta_ms: etaMs(
+        position,
+        job.kind === 'encode-vibe'
+          ? config.encodeMinGapMs
+          : averageGapMs(config.minGapMs, config.maxGapMs)
+      ),
       anlas_est: typeof job.anlasEst === 'number'
         ? job.anlasEst
         : estimateAnlas(job.body, { opus: config.opusFree }),
-      anlas_actual: typeof job.anlasActual === 'number' ? job.anlasActual : null,
+      ...(typeof job.anlasActual === 'number' ? { anlas_actual: job.anlasActual } : {}),
       error: job.error,
       code: job.errorCode,
     });
@@ -189,7 +195,8 @@ export function createApp(config) {
         .json({ error: '任务尚未完成', status: job.status, code: job.errorCode || null });
     }
     res.set('Content-Type', job.contentType || 'application/zip');
-    if ((job.contentType || '').includes('zip')) {
+    // 只有 zip（生图结果）才当附件下载；vibe 编码结果是裸字节，前端直接读
+    if (/zip/i.test(job.contentType || 'application/zip')) {
       res.set('Content-Disposition', 'attachment; filename="result.zip"');
     }
     res.send(job.resultBuf);
@@ -204,29 +211,46 @@ export function createApp(config) {
     res.json({ cancelled: ok, status: job.status });
   });
 
-  // ---- Vibe 编码（同一串行队列，裸字节返回）----
+  // ---- 提交 vibe 编码任务 ----
+  // 与 /submit 同一条串行队列（共用限速 / 单一真 key / 用量统计），只是打 NAI 的 /ai/encode-vibe。
+  // 结果是一段裸字节（vibe encoding），照常 GET /status 轮询 + GET /result 取。
   app.post('/encode-vibe', auth, (req, res) => {
     const body = req.body;
-    if (!config.naiKey) return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
-    if (!body || typeof body !== 'object' || !body.image || !body.information_extracted || !body.model) {
-      return res.status(400).json({ error: 'body 缺少 image / information_extracted / model', code: 'BAD_BODY' });
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ error: 'body 必须是 NAI 请求的 JSON 对象', code: 'BAD_BODY' });
+    }
+    if (body.image == null || body.information_extracted == null || !body.model) {
+      return res
+        .status(400)
+        .json({ error: 'body 需要 image / information_extracted / model 三个字段', code: 'BAD_BODY' });
+    }
+    if (!config.naiKey) {
+      return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     }
     const id = queue.submit(req.token, body, 'encode-vibe');
     const job = queue.get(id);
-    job.anlasEst = 2;
+    job.anlasEst = 2; // NAI 每次 vibe 编码固定 2 Anlas
     const position = queue.position(id);
-    res.json({ job_id: id, status: 'queued', position, eta_ms: etaMs(position, config.encodeMinGapMs), anlas_est: 2 });
+    res.json({
+      job_id: id,
+      status: 'queued',
+      position,
+      eta_ms: etaMs(position, config.encodeMinGapMs),
+      anlas_est: job.anlasEst,
+    });
   });
 
-  // ---- 当前 Anlas 余额（60 秒缓存）----
+  // ---- 查 Anlas 余额（朋友端显示用）----
+  // 优先走缓存：每跑完一单 runner 都会顺手刷新，正常用不着额外打 NAI。
+  const BALANCE_TTL_MS = 60 * 1000;
   app.get('/balance', auth, async (req, res) => {
-    if (!config.naiKey) return res.json({ balance: null, at: Date.now() });
-    if (typeof balanceCache.balance === 'number' && Date.now() - balanceCache.at < 60_000) {
-      return res.json(balanceCache);
+    if (!config.naiKey) return res.json({ balance: null, at: 0 });
+    if (_balCache.balance != null && Date.now() - _balCache.at < BALANCE_TTL_MS) {
+      return res.json({ balance: _balCache.balance, at: _balCache.at });
     }
-    const balance = await readBalance();
-    if (typeof balance === 'number') balanceCache = { balance, at: Date.now() };
-    res.json(typeof balance === 'number' ? balanceCache : { balance: null, at: Date.now() });
+    const balance = await fetchAnlasBalance(balanceOpts);
+    if (balance != null) _balCache = { balance, at: Date.now() };
+    res.json({ balance, at: _balCache.at });
   });
 
   // ---- NAI 原生兼容端点 ----
