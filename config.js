@@ -51,7 +51,9 @@ export function loadConfig(env = process.env) {
       retryMaxMs: numEnv(env.NAI_RETRY_MAX_MS, 30000),
     },
 
-    // Express body 上限：vibe encoding 较大（单个 ~64KB，可能多个），给足余量
+    // Express body 上限：/encode-vibe 的请求体里装的是【原图 base64】（不是编码结果），
+    // 大图 base64 膨胀 4/3 后轻松破 10MB。这里刻意【不调大】——免费套餐机器，放开上限
+    // 容易超流量/内存；客户端会先把超限的图压成 WebP，压不进就本地拦下不发请求。
     bodyLimit: env.BODY_LIMIT || '12mb',
 
     // 用量统计 / 管理端

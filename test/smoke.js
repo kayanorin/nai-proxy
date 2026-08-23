@@ -110,8 +110,8 @@ async function statusReq(base, id, token = 'tok1') {
   return fetch(base + '/status/' + id, { headers: token ? { 'X-Access-Token': token } : {} });
 }
 
-function vibeBody(ie = 0.5) {
-  return { image: 'QUJD', information_extracted: ie, model: 'nai-diffusion-4-5-full' };
+function vibeBody(ie = 0.5, image = 'QUJD') {
+  return { image, information_extracted: ie, model: 'nai-diffusion-4-5-full' };
 }
 async function encodeVibe(base, body, token = 'tok1') {
   return fetch(base + '/encode-vibe', {
@@ -452,6 +452,17 @@ await test('vibe 编码：缺字段 → 400，无令牌 → 401', () =>
     assert(bad.status === 400, `缺字段应 400，实际 ${bad.status}`);
     const noTok = await encodeVibe(base, vibeBody(), null);
     assert(noTok.status === 401, `无令牌应 401，实际 ${noTok.status}`);
+  }));
+
+// body 超限的 413 必须带 CORS 头：否则浏览器把它当 CORS 违规拦掉，
+// 前端只看得到「Failed to fetch」，用户完全不知道是图太大（曾经踩过）。
+await test('body 超限 → 413 JSON 且带 CORS 头', () =>
+  withProxy({ minGapMs: 10, bodyLimit: '100kb' }, async ({ base }) => {
+    const r = await encodeVibe(base, vibeBody(0.5, 'A'.repeat(200 * 1024)));
+    assert(r.status === 413, `超限应 413，实际 ${r.status}`);
+    assert(r.headers.get('access-control-allow-origin') === '*', '413 响应必须带 CORS 头');
+    const j = await r.json();
+    assert(j.code === 'BODY_TOO_LARGE', `应回 BODY_TOO_LARGE，实际 ${j.code}`);
   }));
 
 await test('点数统计走实测：记的是余额差值而非估算', () =>

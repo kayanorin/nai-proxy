@@ -17,8 +17,10 @@ import { ResourceStore, isFreeV5Request } from './resources.js';
 export function createApp(config) {
   const app = express();
   app.disable('x-powered-by');
-
   // ---- CORS（无 cookie，允许任意源 + 自定义头；覆盖 file:// 的 null 源）----
+  // ⚠️ 必须排在 express.json 之前：body 超限时 body-parser 会直接抛错跳到错误处理，
+  // 后面的中间件一个都不跑。若 CORS 排在后面，那个 413 就没有 Access-Control-Allow-Origin，
+  // 浏览器会把它当 CORS 违规拦掉，前端只看得到「Failed to fetch」，没法排查。
   app.use((req, res, next) => {
     res.set('Access-Control-Allow-Origin', '*');
     res.set('Vary', 'Origin');
@@ -525,6 +527,23 @@ export function createApp(config) {
   app.use((req, res) => {
     console.log(JSON.stringify({ evt: 'unmatched', method: req.method, path: req.path }));
     res.status(404).json({ error: '未知路径：' + req.path, code: 'NO_ROUTE' });
+  });
+
+  // ---- 错误兜底：body 超限 / JSON 非法 → JSON 响应 ----
+  // Express 默认的错误页是 HTML 且带完整堆栈（会泄露服务器路径），前端也解析不了。
+  // 必须是 4 参数签名，Express 才认它是错误中间件。
+  app.use((err, req, res, next) => {
+    if (err?.type === 'entity.too.large') {
+      return res.status(413).json({
+        error: `图片太大：请求体超过服务端上限（${config.bodyLimit || '12mb'}），请换小一点的图`,
+        code: 'BODY_TOO_LARGE',
+      });
+    }
+    if (err?.type === 'entity.parse.failed') {
+      return res.status(400).json({ error: '请求体不是合法 JSON', code: 'BAD_JSON' });
+    }
+    console.error('[nai-proxy] 未处理错误：', err);
+    res.status(500).json({ error: '服务端内部错误', code: 'INTERNAL' });
   });
 
   return app;
