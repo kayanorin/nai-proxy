@@ -14,9 +14,10 @@ export class JobQueue {
    * @param {number} [opts.resultTtlMs]
    * @param {number} [opts.maxJobs]
    */
-  constructor({ runner, onSettled = null, minGapMs = 8000, maxGapMs = 12000, encodeMinGapMs = 3000, random = Math.random, resultTtlMs = 600000, maxJobs = 200 }) {
+  constructor({ runner, onSettled = null, priority = null, minGapMs = 8000, maxGapMs = 12000, encodeMinGapMs = 3000, random = Math.random, resultTtlMs = 600000, maxJobs = 200 }) {
     this.runner = runner;
     this.onSettled = onSettled;
+    this.priority = priority;
     this.minGapMs = minGapMs;
     this.maxGapMs = Math.max(minGapMs, maxGapMs);
     this.encodeMinGapMs = encodeMinGapMs;
@@ -28,6 +29,8 @@ export class JobQueue {
     this.jobs = new Map();
     /** @type {string[]} FIFO，存 job id */
     this.queue = [];
+    this.tokenOrder = [];
+    this.lastTokenIndex = -1;
     this.working = false;
     this.lastStartAt = 0; // 上次向 NAI 发起请求的时间戳（限速基准）
     this._reaper = null;
@@ -45,6 +48,7 @@ export class JobQueue {
       contentType: null,
       error: null,
       errorCode: null,
+      errorDetails: null,
       abort: null,
       createdAt: Date.now(),
       startedAt: 0,
@@ -52,6 +56,7 @@ export class JobQueue {
     };
     this.jobs.set(id, job);
     this.queue.push(id);
+    if (!this.tokenOrder.includes(token)) this.tokenOrder.push(token);
     this._evictIfNeeded();
     this._kick();
     return id;
@@ -72,7 +77,7 @@ export class JobQueue {
 
   // 队列里的位次（1 起）；不在队列（运行中/已结束）返回 null
   position(id) {
-    const i = this.queue.indexOf(id);
+    const i = this._scheduledIds().indexOf(id);
     return i < 0 ? null : i + 1;
   }
 
@@ -119,10 +124,10 @@ export class JobQueue {
     this.working = true;
     try {
       while (this.queue.length) {
-        const id = this.queue[0]; // 先 peek，限速等待期间保持在队列里（位次准确）
+        const id = this._nextQueuedId(); // per-token round-robin; keep queued during gap wait
         const job = this.jobs.get(id);
         if (!job || job.status !== 'queued') {
-          this.queue.shift();
+          this._removeQueuedId(id);
           continue;
         }
 
@@ -133,11 +138,13 @@ export class JobQueue {
 
         // 等待期间可能被取消
         if (job.status !== 'queued') {
-          this.queue.shift();
+          this._removeQueuedId(id);
           continue;
         }
 
-        this.queue.shift();
+        this._removeQueuedId(id);
+        const servedIndex = this.tokenOrder.indexOf(job.token);
+        if (servedIndex >= 0) this.lastTokenIndex = servedIndex;
         job.status = 'running';
         job.startedAt = Date.now();
         job.abort = new AbortController();
@@ -154,6 +161,7 @@ export class JobQueue {
           job.status = 'failed';
           job.error = e?.message || String(e);
           job.errorCode = e?.code || 'ERROR';
+          job.errorDetails = e?.details || null;
         } finally {
           if (!job.finishedAt) job.finishedAt = Date.now();
           this._settle(job);
@@ -168,6 +176,50 @@ export class JobQueue {
     if (this.maxGapMs <= this.minGapMs) return this.minGapMs;
     const unit = Math.max(0, Math.min(0.999999999, Number(this.random()) || 0));
     return this.minGapMs + Math.floor(unit * (this.maxGapMs - this.minGapMs + 1));
+  }
+
+  _removeQueuedId(id) {
+    const index = this.queue.indexOf(id);
+    if (index >= 0) this.queue.splice(index, 1);
+  }
+
+  _nextQueuedId(queue = this.queue, cursor = this.lastTokenIndex) {
+    if (!queue.length) return null;
+    const available = new Set(queue.map((id) => this.jobs.get(id)?.token).filter(Boolean));
+    if (this.priority && available.size > 1) {
+      const candidates = [...available].map((token) => {
+        const id = queue.find((queuedId) => this.jobs.get(queuedId)?.token === token);
+        const score = Number(this.priority(this.jobs.get(id)));
+        return { id, score };
+      }).filter((candidate) => Number.isFinite(candidate.score));
+      if (candidates.length > 1) {
+        candidates.sort((a, b) => a.score - b.score);
+        if (candidates[0].score + 1e-9 < candidates[1].score) return candidates[0].id;
+      }
+    }
+    for (let offset = 1; offset <= this.tokenOrder.length; offset++) {
+      const index = (cursor + offset + this.tokenOrder.length) % this.tokenOrder.length;
+      const token = this.tokenOrder[index];
+      if (!available.has(token)) continue;
+      return queue.find((id) => this.jobs.get(id)?.token === token) || null;
+    }
+    return queue[0] || null;
+  }
+
+  _scheduledIds() {
+    const remaining = [...this.queue];
+    const ordered = [];
+    let cursor = this.lastTokenIndex;
+    while (remaining.length) {
+      const id = this._nextQueuedId(remaining, cursor);
+      if (!id) break;
+      ordered.push(id);
+      const token = this.jobs.get(id)?.token;
+      const index = this.tokenOrder.indexOf(token);
+      if (index >= 0) cursor = index;
+      remaining.splice(remaining.indexOf(id), 1);
+    }
+    return ordered;
   }
 
   // 统一收尾：跑 onSettled 回调 + 兑现所有 waitFor。

@@ -42,12 +42,20 @@ export class ActivityStore {
       );
       CREATE INDEX IF NOT EXISTS idx_activity_bucket ON activity_hourly(bucket_utc);
     `);
+    this._ensureColumn('v5_free', 'REAL NOT NULL DEFAULT 0');
+    this._ensureColumn('battery_borrowed', 'REAL NOT NULL DEFAULT 0');
+    this._ensureColumn('subscription_anlas', 'REAL NOT NULL DEFAULT 0');
+    this._ensureColumn('purchased_anlas', 'REAL NOT NULL DEFAULT 0');
     this.upsert = this.db.prepare(`
-      INSERT INTO activity_hourly(user_id, bucket_utc, kind, request_count, anlas)
-      VALUES (?, ?, ?, 1, ?)
+      INSERT INTO activity_hourly(user_id, bucket_utc, kind, request_count, anlas, v5_free, battery_borrowed, subscription_anlas, purchased_anlas)
+      VALUES (?, ?, ?, 1, ?, ?, ?, ?, ?)
       ON CONFLICT(user_id, bucket_utc, kind) DO UPDATE SET
         request_count = request_count + 1,
-        anlas = anlas + excluded.anlas
+        anlas = anlas + excluded.anlas,
+        v5_free = v5_free + excluded.v5_free,
+        battery_borrowed = battery_borrowed + excluded.battery_borrowed,
+        subscription_anlas = subscription_anlas + excluded.subscription_anlas,
+        purchased_anlas = purchased_anlas + excluded.purchased_anlas
     `);
     this.cleanup(true);
   }
@@ -57,12 +65,36 @@ export class ActivityStore {
     return VALID_DAYS.has(days) ? days : null;
   }
 
-  record(token, { at, kind = 'generate', anlas = 0 } = {}) {
+  _ensureColumn(name, definition) {
+    const columns = this.db.prepare('PRAGMA table_info(activity_hourly)').all();
+    if (!columns.some((column) => column.name === name)) {
+      this.db.exec(`ALTER TABLE activity_hourly ADD COLUMN ${name} ${definition}`);
+    }
+  }
+
+  record(token, {
+    at,
+    kind = 'generate',
+    anlas = 0,
+    v5Free = 0,
+    batteryBorrowed = 0,
+    subscriptionAnlas = 0,
+    purchasedAnlas = 0,
+  } = {}) {
     const profile = this.profilesByToken.get(token);
     if (!profile) return false;
     const time = Number(at) || this.now();
     const bucket = Math.floor(time / 3_600_000) * 3_600_000;
-    this.upsert.run(profile.id, bucket, kind, Number(anlas) || 0);
+    this.upsert.run(
+      profile.id,
+      bucket,
+      kind,
+      Number(anlas) || 0,
+      Number(v5Free) || 0,
+      Number(batteryBorrowed) || 0,
+      Number(subscriptionAnlas) || 0,
+      Number(purchasedAnlas) || 0
+    );
     this.cleanup();
     return true;
   }
@@ -86,11 +118,15 @@ export class ActivityStore {
     const now = this.now();
     const from = now - days * DAY_MS;
     const rows = userId === 'all'
-      ? this.db.prepare('SELECT user_id, bucket_utc, request_count, anlas FROM activity_hourly WHERE bucket_utc >= ?').all(from)
-      : this.db.prepare('SELECT user_id, bucket_utc, request_count, anlas FROM activity_hourly WHERE user_id = ? AND bucket_utc >= ?').all(userId, from);
+      ? this.db.prepare('SELECT user_id, bucket_utc, request_count, anlas, v5_free, battery_borrowed, subscription_anlas, purchased_anlas FROM activity_hourly WHERE bucket_utc >= ?').all(from)
+      : this.db.prepare('SELECT user_id, bucket_utc, request_count, anlas, v5_free, battery_borrowed, subscription_anlas, purchased_anlas FROM activity_hourly WHERE user_id = ? AND bucket_utc >= ?').all(userId, from);
     const hours = Array.from({ length: 24 }, (_, hour) => ({ hour, count: 0 }));
     let requests = 0;
     let anlas = 0;
+    let v5Free = 0;
+    let batteryBorrowed = 0;
+    let subscriptionAnlas = 0;
+    let purchasedAnlas = 0;
     for (const row of rows) {
       const profile = this.profilesById.get(row.user_id);
       if (!profile) continue;
@@ -98,6 +134,10 @@ export class ActivityStore {
       hours[hour].count += Number(row.request_count) || 0;
       requests += Number(row.request_count) || 0;
       anlas += Number(row.anlas) || 0;
+      v5Free += Number(row.v5_free) || 0;
+      batteryBorrowed += Number(row.battery_borrowed) || 0;
+      subscriptionAnlas += Number(row.subscription_anlas) || 0;
+      purchasedAnlas += Number(row.purchased_anlas) || 0;
     }
     const profile = userId === 'all' ? null : this.profilesById.get(userId);
     const out = {
@@ -106,7 +146,7 @@ export class ActivityStore {
       scope: profile
         ? { id: profile.id, name: profile.name, timeZone: profile.timeZone }
         : { id: 'all', name: 'All users', timeZone: 'local-per-user' },
-      totals: { requests, anlas },
+      totals: { requests, anlas, v5Free, batteryBorrowed, subscriptionAnlas, purchasedAnlas },
       hours,
     };
     if (includeUsers) {

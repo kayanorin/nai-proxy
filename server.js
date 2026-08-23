@@ -8,15 +8,15 @@ import express from 'express';
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
 import { JobQueue } from './queue.js';
-import { callNAIWithRetry, fetchAnlasBalance } from './nai.js';
+import { callNAIWithRetry, fetchAnlasBalance, fetchSubscription } from './nai.js';
 import { estimateAnlas } from './anlas.js';
 import { UsageStats } from './stats.js';
 import { ActivityStore } from './activity.js';
+import { ResourceStore, isFreeV5Request } from './resources.js';
 
 export function createApp(config) {
   const app = express();
   app.disable('x-powered-by');
-  app.use(express.json({ limit: config.bodyLimit || '12mb' }));
 
   // ---- CORS（无 cookie，允许任意源 + 自定义头；覆盖 file:// 的 null 源）----
   app.use((req, res, next) => {
@@ -24,11 +24,12 @@ export function createApp(config) {
     res.set('Vary', 'Origin');
     res.set('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     // X-Access-Token：网页端用；Authorization：NAI 原生兼容端点用（酒馆插件只能填 key→Bearer）
-    res.set('Access-Control-Allow-Headers', 'Content-Type, X-Access-Token, Authorization');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, X-Access-Token, X-Spend-Policy, Authorization');
     res.set('Access-Control-Max-Age', '86400');
     if (req.method === 'OPTIONS') return res.sendStatus(204); // 预检
     next();
   });
+  app.use(express.json({ limit: config.bodyLimit || '12mb' }));
 
   // 按令牌累计用量（内存聚合；逐条账本走下面 onSettled 里的 stdout `usage` 日志）
   const stats = new UsageStats();
@@ -41,12 +42,38 @@ export function createApp(config) {
   });
   app.set('activityStore', activity);
 
+  const resources = new ResourceStore({
+    dbPath: config.statsDbPath || ':memory:',
+    accessTokens: config.accessTokens,
+    userProfiles: config.userProfiles || new Map(),
+  });
+  app.set('resourceStore', resources);
+
   let balanceCache = { balance: null, at: 0 };
   const readBalance = (signal) => fetchAnlasBalance({
     baseUrl: config.naiApiBaseUrl || config.naiBaseUrl,
     apiKey: config.naiKey,
     signal,
   });
+  const readSubscription = (signal) => fetchSubscription({
+    baseUrl: config.naiApiBaseUrl || config.naiBaseUrl,
+    apiKey: config.naiKey,
+    signal,
+  });
+  let subscriptionCache = { value: null, at: 0 };
+  async function refreshResources({ signal, force = false } = {}) {
+    if (!force && subscriptionCache.value && Date.now() - subscriptionCache.at < 30_000) {
+      resources.reconcile(subscriptionCache.value);
+      return subscriptionCache.value;
+    }
+    const value = await readSubscription(signal);
+    if (value) {
+      subscriptionCache = { value, at: Date.now() };
+      resources.reconcile(value);
+      balanceCache = { balance: value.anlas.total, at: Date.now() };
+    }
+    return value;
+  }
 
   const queue = new JobQueue({
     minGapMs: config.minGapMs,
@@ -55,8 +82,34 @@ export function createApp(config) {
     random: config.random,
     resultTtlMs: config.resultTtlMs,
     maxJobs: config.maxJobs,
+    priority: (job) => {
+      if (job?.billingMode === 'v5-battery') {
+        const gate = resources.canUseBattery(job.token, 1);
+        if (gate.source === 'shared') return resources.fairnessPriority(job.token, 'battery');
+      }
+      if (job?.billingMode === 'anlas-confirmed') {
+        return resources.fairnessPriority(job.token, 'subscription');
+      }
+      return Number.NaN;
+    },
     runner: async (job, signal) => {
-      const before = await readBalance(signal);
+      const beforeSubscription = await refreshResources({ signal, force: true });
+      if (job.billingMode === 'v5-battery') {
+        const gate = resources.canUseBattery(job.token, 1);
+        if (!gate.ok) {
+          const e = new Error(gate.reason === 'reserved'
+            ? 'V5 电量已进入好友保留区，请稍后重试或切换 V4.5'
+            : 'V5 免费电量已耗尽');
+          e.code = gate.reason === 'reserved' ? 'V5_QUOTA_WAIT' : 'V5_ANLAS_CONFIRM_REQUIRED';
+          e.details = {
+            anlas_est: estimateAnlas(job.body, { opus: false }),
+            fallback_model: String(job.body?.model).includes('curated')
+              ? 'nai-diffusion-4-5-curated' : 'nai-diffusion-4-5-full',
+            resources: resources.forToken(job.token),
+          };
+          throw e;
+        }
+      }
       const result = await callNAIWithRetry(job.body, {
         baseUrl: config.naiBaseUrl,
         apiKey: config.naiKey,
@@ -64,10 +117,15 @@ export function createApp(config) {
         path: job.kind === 'encode-vibe' ? '/ai/encode-vibe' : '/ai/generate-image',
         ...config.retry,
       });
-      const after = await readBalance(signal);
-      if (typeof after === 'number') balanceCache = { balance: after, at: Date.now() };
-      if (typeof before === 'number' && typeof after === 'number') {
-        job.anlasActual = Math.max(0, before - after);
+      const afterSubscription = await readSubscription(signal);
+      if (afterSubscription) {
+        subscriptionCache = { value: afterSubscription, at: Date.now() };
+        balanceCache = { balance: afterSubscription.anlas.total, at: Date.now() };
+      }
+      if (beforeSubscription && afterSubscription) {
+        const settled = resources.settleAuthoritative(job, beforeSubscription, afterSubscription);
+        job.anlasActual = settled.anlas;
+        job.billingActual = settled;
       }
       return result;
     },
@@ -80,7 +138,15 @@ export function createApp(config) {
           ? job.anlasEst
           : estimateAnlas(job.body, { opus: config.opusFree });
       stats.record(job.token, anlas);
-      activity.record(job.token, { at: job.createdAt, kind: job.kind, anlas });
+      activity.record(job.token, {
+        at: job.createdAt,
+        kind: job.kind,
+        anlas,
+        v5Free: job.billingMode === 'v5-battery' ? 1 : 0,
+        batteryBorrowed: Number(job.billingActual?.batteryBorrowed || 0),
+        subscriptionAnlas: Number(job.billingActual?.subscription || 0),
+        purchasedAnlas: Number(job.billingActual?.purchased || 0),
+      });
       const p = (job.body && job.body.parameters) || {};
       const profile = activity.profileForToken(job.token);
       console.log(JSON.stringify({
@@ -93,6 +159,8 @@ export function createApp(config) {
         samples: p.n_samples || 1,
         kind: job.kind,
         anlas,
+        billingMode: job.billingMode || null,
+        billingActual: job.billingActual || null,
       }));
     },
   });
@@ -134,8 +202,74 @@ export function createApp(config) {
     }
   });
 
+  async function prepareBilling(req, res, body) {
+    const freeV5 = isFreeV5Request(body) && config.opusFree;
+    const subscription = await refreshResources();
+    const spendPolicy = String(req.get('X-Spend-Policy') || '').toLowerCase();
+    if (freeV5) {
+      if (!subscription) {
+        res.status(503).json({
+          error: '暂时无法读取 V5 电量，已阻止提交以避免意外消耗 Anlas',
+          code: 'RESOURCE_UNAVAILABLE',
+        });
+        return null;
+      }
+      const gate = resources.canUseBattery(req.token, 1);
+      if (gate.ok) return { mode: 'v5-battery', anlasEst: 0 };
+      const fallbackModel = String(body.model).includes('full')
+        ? 'nai-diffusion-4-5-full'
+        : 'nai-diffusion-4-5-curated';
+      if (gate.reason === 'reserved') {
+        res.status(409).json({
+          error: 'V5 电量已进入好友保留区，请稍后重试或切换 V4.5',
+          code: 'V5_QUOTA_WAIT',
+          fallback_model: fallbackModel,
+          resources: resources.forToken(req.token),
+        });
+        return null;
+      }
+      const anlasEst = estimateAnlas(body, { opus: false });
+      if (spendPolicy !== 'allow-anlas') {
+        res.status(409).json({
+          error: 'V5 免费电量已耗尽，需要明确选择是否使用 Anlas',
+          code: 'V5_ANLAS_CONFIRM_REQUIRED',
+          anlas_est: anlasEst,
+          fallback_model: fallbackModel,
+          resources: resources.forToken(req.token),
+        });
+        return null;
+      }
+      const paidGate = resources.canSpendAnlas(req.token, anlasEst);
+      if (!paidGate.ok) {
+        res.status(paidGate.reason === 'paused' ? 423 : 402).json({
+          error: paidGate.reason === 'paused' ? '共享 Anlas 消耗已被车主暂停' : '个人与共享 Anlas 均不足',
+          code: paidGate.reason === 'paused' ? 'ANLAS_PAUSED' : 'INSUFFICIENT_SHARED_ANLAS',
+          anlas_est: anlasEst,
+          available: paidGate.available || 0,
+        });
+        return null;
+      }
+      return { mode: 'anlas-confirmed', anlasEst };
+    }
+
+    const anlasEst = estimateAnlas(body, { opus: config.opusFree });
+    if (subscription && anlasEst > 0) {
+      const gate = resources.canSpendAnlas(req.token, anlasEst);
+      if (!gate.ok) {
+        res.status(gate.reason === 'paused' ? 423 : 402).json({
+          error: gate.reason === 'paused' ? '共享 Anlas 消耗已被车主暂停' : '个人与共享 Anlas 均不足',
+          code: gate.reason === 'paused' ? 'ANLAS_PAUSED' : 'INSUFFICIENT_SHARED_ANLAS',
+          anlas_est: anlasEst,
+          available: gate.available || 0,
+        });
+        return null;
+      }
+    }
+    return { mode: anlasEst > 0 ? 'anlas' : 'free-v4', anlasEst };
+  }
+
   // ---- 提交任务 ----
-  app.post('/submit', auth, (req, res) => {
+  app.post('/submit', auth, async (req, res) => {
     const body = req.body;
     if (!body || typeof body !== 'object' || Array.isArray(body)) {
       return res.status(400).json({ error: 'body 必须是 NAI 请求的 JSON 对象', code: 'BAD_BODY' });
@@ -144,10 +278,12 @@ export function createApp(config) {
       return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     }
     clampBody(body, config);
+    const billing = await prepareBilling(req, res, body);
+    if (!billing) return;
     const id = queue.submit(req.token, body, 'generate');
     const job = queue.get(id);
-    // 估点一次存到 job 上：/status 复用、完成计入统计，三处同一个数
-    job.anlasEst = estimateAnlas(body, { opus: config.opusFree });
+    job.anlasEst = billing.anlasEst;
+    job.billingMode = billing.mode;
     const position = queue.position(id);
     res.json({
       job_id: id,
@@ -155,6 +291,7 @@ export function createApp(config) {
       position,
       eta_ms: etaMs(position, averageGapMs(config.minGapMs, config.maxGapMs)),
       anlas_est: job.anlasEst,
+      billing_mode: job.billingMode,
     });
   });
 
@@ -173,8 +310,11 @@ export function createApp(config) {
         ? job.anlasEst
         : estimateAnlas(job.body, { opus: config.opusFree }),
       anlas_actual: typeof job.anlasActual === 'number' ? job.anlasActual : null,
+      billing_mode: job.billingMode || null,
+      billing_actual: job.billingActual || null,
       error: job.error,
       code: job.errorCode,
+      ...(job.errorDetails || {}),
     });
   });
 
@@ -205,15 +345,25 @@ export function createApp(config) {
   });
 
   // ---- Vibe 编码（同一串行队列，裸字节返回）----
-  app.post('/encode-vibe', auth, (req, res) => {
+  app.post('/encode-vibe', auth, async (req, res) => {
     const body = req.body;
     if (!config.naiKey) return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     if (!body || typeof body !== 'object' || !body.image || !body.information_extracted || !body.model) {
       return res.status(400).json({ error: 'body 缺少 image / information_extracted / model', code: 'BAD_BODY' });
     }
+    const subscription = await refreshResources();
+    if (subscription) {
+      const gate = resources.canSpendAnlas(req.token, 2);
+      if (!gate.ok) return res.status(gate.reason === 'paused' ? 423 : 402).json({
+        error: gate.reason === 'paused' ? '共享 Anlas 消耗已被车主暂停' : '个人与共享 Anlas 均不足',
+        code: gate.reason === 'paused' ? 'ANLAS_PAUSED' : 'INSUFFICIENT_SHARED_ANLAS',
+        anlas_est: 2,
+      });
+    }
     const id = queue.submit(req.token, body, 'encode-vibe');
     const job = queue.get(id);
     job.anlasEst = 2;
+    job.billingMode = 'anlas';
     const position = queue.position(id);
     res.json({ job_id: id, status: 'queued', position, eta_ms: etaMs(position, config.encodeMinGapMs), anlas_est: 2 });
   });
@@ -227,6 +377,12 @@ export function createApp(config) {
     const balance = await readBalance();
     if (typeof balance === 'number') balanceCache = { balance, at: Date.now() };
     res.json(typeof balance === 'number' ? balanceCache : { balance: null, at: Date.now() });
+  });
+
+  app.get('/resources/me', auth, async (req, res) => {
+    const subscription = await refreshResources();
+    if (!subscription) return res.status(503).json({ error: '暂时无法读取账户资源', code: 'RESOURCE_UNAVAILABLE' });
+    res.json({ version: 1, ...resources.forToken(req.token) });
   });
 
   // ---- NAI 原生兼容端点 ----
@@ -258,9 +414,12 @@ export function createApp(config) {
       return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     }
     clampBody(body, config);
+    const billing = await prepareBilling(req, res, body);
+    if (!billing) return;
     const id = queue.submit(req.token, body, 'generate');
     const job = queue.get(id);
-    job.anlasEst = estimateAnlas(body, { opus: config.opusFree }); // 与 /submit 同口径，完成时计入统计
+    job.anlasEst = billing.anlasEst;
+    job.billingMode = billing.mode;
 
     // 客户端断开（超时 / 手动停）时取消任务，别白烧 Anlas、也别占着 worker
     let settled = false;
@@ -281,7 +440,7 @@ export function createApp(config) {
     // failed：把 NAI 错误映射成合适的 HTTP 状态（车主 key 的问题对插件用户算 502，不是他们的锅）
     return res
       .status(naiErrStatus(job.errorCode))
-      .json({ error: job.error || 'NAI 生成失败', code: job.errorCode || 'ERROR' });
+      .json({ error: job.error || 'NAI 生成失败', code: job.errorCode || 'ERROR', ...(job.errorDetails || {}) });
   });
 
   // ---- 用量统计（车主专用，设了 ADMIN_TOKEN 才开；朋友令牌看不到）----
@@ -299,6 +458,21 @@ export function createApp(config) {
     const snap = stats.snapshot();
     for (const [token, entry] of Object.entries(snap.tokens)) Object.assign(entry, activity.profileForToken(token) || {});
     res.json(snap);
+  });
+  app.get('/resources', adminAuth, async (req, res) => {
+    const subscription = await refreshResources();
+    if (!subscription) return res.status(503).json({ error: '暂时无法读取账户资源', code: 'RESOURCE_UNAVAILABLE' });
+    res.json({ version: 1, ...resources.snapshot() });
+  });
+  app.post('/resources/pause-paid', adminAuth, (req, res) => {
+    resources.setPaidPaused(req.body?.paused !== false);
+    res.json({ ok: true, paidPaused: resources.snapshot().paidPaused });
+  });
+  app.post('/resources/rebuild', adminAuth, async (req, res) => {
+    const subscription = await readSubscription();
+    if (!subscription) return res.status(503).json({ error: '暂时无法读取账户资源', code: 'RESOURCE_UNAVAILABLE' });
+    subscriptionCache = { value: subscription, at: Date.now() };
+    res.json({ ok: true, version: 1, ...resources.rebuild(subscription) });
   });
   app.get('/stats/me/activity', auth, (req, res) => {
     const days = ActivityStore.validDays(req.query.days ?? 7);

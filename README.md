@@ -34,12 +34,20 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `POST /cancel/:id` | 是 | 排队中直接移除；运行中 Abort 中断 |
 | `POST /encode-vibe` | 是 | Vibe 编码任务；进入同一队列，完成后由 `/result/:id` 返回原始字节 |
 | `GET /balance` | 是 | 当前 Anlas 余额（短时缓存；不可用时返回 `null`） |
+| `GET /resources/me` | 是 | 当前朋友的 V5 电量、个人/共享池、借用债务、两类 Anlas 与到期状态 |
+| `GET /resources` | 管理员 | 全部资源池、匿名用户账本、共享量、债务与安全线 |
+| `POST /resources/pause-paid` | 管理员 | 紧急暂停/恢复所有付费 Anlas 消耗 |
+| `POST /resources/rebuild` | 管理员 | 按 NovelAI 当前真实余额等额重建账本 |
 | `GET /stats/me/activity?days=7` | 是 | 当前令牌自己的 7/30/90 天本地小时活动，不返回其他用户 |
 | `GET /stats/activity?days=7&user=all` | 管理员 | 全体或单用户活动；`X-Access-Token` 使用 `ADMIN_TOKEN` |
 | `GET /stats/ui` | 页面公开，数据需管理员 | 车主活动统计页面；管理员令牌只保存在浏览器本地 |
 | `POST /ai/generate-image` | 是* | **NAI 原生兼容**：同步生图（入同一队列、阻塞等出图、原样回 zip/msgpack）。给只能填 NAI key 的第三方客户端用（如酒馆插件） |
 
 鉴权：网页端用请求头 `X-Access-Token: <你的令牌>`。任务与提交它的令牌绑定，他人令牌查不到（403）。
+
+V5 普通单张请求默认使用 `X-Spend-Policy: free-only`。电量不足时服务返回
+`V5_ANLAS_CONFIRM_REQUIRED`，客户端必须让当前用户明确选择后，以
+`X-Spend-Policy: allow-anlas` 重新提交；不带该头不会消耗 Anlas。
 
 > \* `/ai/generate-image` 例外：它从 `Authorization: Bearer <令牌>` 读令牌（也兼容 `X-Access-Token`），因为第三方客户端通常只有「NAI key」一个输入框——把**访问令牌**填进去即可。
 
@@ -70,7 +78,7 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `NAI_API_BASE_URL` | `NAI_BASE_URL` / NAI image host | 查询余额；测试时指向本地 mock |
 | `MAX_JOBS` | `200` | 内存里最多保留多少 job |
 | `PORT` | `3000` | Render 自动注入 |
-| `STATS_DB_PATH` | `./data/stats.sqlite` | 活动小时聚合 SQLite 路径；Oracle 推荐 `/var/lib/nai-proxy/stats.sqlite` |
+| `STATS_DB_PATH` | `./data/stats.sqlite` | 活动与公平资源账本的 SQLite 路径；生产环境必须放在持久卷 |
 | `STATS_RETENTION_DAYS` | `90` | 活动历史保留天数 |
 | `USER_PROFILES_JSON` | `{}` | 访问令牌到显示名与 IANA 时区的 JSON 映射 |
 
@@ -89,7 +97,7 @@ NAI_KEY=你的key ACCESS_TOKENS=tok1 node server.js
 npm run smoke   # 若 npm 脚本找不到 node，直接：node test/smoke.js
 ```
 
-`npm test` 会先跑 19 项 mock 冒烟，再跑 SQLite 活动测试。覆盖令牌隔离、生成与 Vibe 编码、实际 Anlas 与估算回退、活动 API、重试/失败/取消不重复计数，以及持久化、时区/DST、清零和数据库隐私。
+`npm test` 会运行 SQLite 活动/资源账本测试与完整 mock 冒烟。覆盖令牌隔离、V5 免费电量、明确 Anlas 确认、个人/共享池、借用债务、到期共享、生成与 Vibe 编码、活动 API、重试/失败/取消，以及数据库隐私。
 
 ## 部署到 Render
 

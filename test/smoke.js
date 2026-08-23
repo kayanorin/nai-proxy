@@ -86,6 +86,15 @@ function naiBody(input = '1girl', params = {}) {
   };
 }
 
+function v5Body(input = '1girl', params = {}) {
+  return {
+    input,
+    model: 'nai-diffusion-5-full',
+    action: 'generate',
+    parameters: { width: 1024, height: 1024, n_samples: 1, steps: 23, ...params },
+  };
+}
+
 async function submit(base, body, token = 'tok1') {
   return fetch(base + '/submit', {
     method: 'POST',
@@ -332,6 +341,40 @@ await test('余额查询失败时任务成功并回落估算', () =>
     const stats = await (await fetch(base + '/stats', { headers: { 'X-Access-Token': 'admin' } })).json();
     assert(stats.tokens.tok1.anlas > 0, '应回落为正数估算');
     await fetch(MOCK_BASE + '/mock/subscription/on', { method: 'POST' });
+  }));
+
+await test('V5 资源接口 + 免费电量结算', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    await drainAndReset();
+    const before = await (await fetch(base + '/resources/me', { headers: { 'X-Access-Token': 'tok1' } })).json();
+    assert(before.version === 1, '资源接口应声明版本');
+    assert(before.v5.personal === 50, `两人应各 50%，实际 ${before.v5.personal}`);
+    const r = await submit(base, v5Body('v5-free'));
+    const submitted = await r.json();
+    assert(r.status === 200 && submitted.billing_mode === 'v5-battery', '有电时应走 V5 battery');
+    const done = await waitJob(base, submitted.job_id);
+    assert(done.status === 'done' && done.billing_mode === 'v5-battery', 'V5 battery 任务应成功');
+    const activity = await (await fetch(base + '/stats/me/activity?days=7', { headers: { 'X-Access-Token': 'tok1' } })).json();
+    assert(activity.totals.v5Free === 1, '活动应记录一次 V5 免费生成');
+  }));
+
+await test('V5 电量耗尽必须明确确认 Anlas', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    await drainAndReset();
+    await fetch(MOCK_BASE + '/mock/battery/0', { method: 'POST' });
+    const denied = await submit(base, v5Body('v5-empty'));
+    const prompt = await denied.json();
+    assert(denied.status === 409 && prompt.code === 'V5_ANLAS_CONFIRM_REQUIRED', '未确认时应返回明确确认错误');
+    assert(prompt.fallback_model === 'nai-diffusion-4-5-full', '应建议匹配的 V4.5 模型');
+    const allowed = await fetch(base + '/submit', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'X-Access-Token': 'tok1', 'X-Spend-Policy': 'allow-anlas' },
+      body: JSON.stringify(v5Body('v5-paid')),
+    });
+    const submitted = await allowed.json();
+    assert(allowed.status === 200 && submitted.billing_mode === 'anlas-confirmed', '确认后应允许使用共享 Anlas');
+    const done = await waitJob(base, submitted.job_id);
+    assert(done.status === 'done' && done.anlas_actual === 7, '确认任务应按实际 Anlas 结算');
   }));
 
 await test('活动 self API：只返回本人 24 小时数据', () =>

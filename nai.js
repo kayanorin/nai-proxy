@@ -78,6 +78,13 @@ export async function callNAIWithRetry(
 }
 
 export async function fetchAnlasBalance({ baseUrl, apiKey, signal } = {}) {
+  const subscription = await fetchSubscription({ baseUrl, apiKey, signal });
+  return subscription ? subscription.anlas.total : null;
+}
+
+// Complete account resource state for V5 battery and split Anlas accounting.
+// Like the legacy balance helper, telemetry failures never throw.
+export async function fetchSubscription({ baseUrl, apiKey, signal } = {}) {
   try {
     const res = await fetch(String(baseUrl).replace(/\/+$/, '') + '/user/subscription', {
       headers: { Authorization: 'Bearer ' + apiKey },
@@ -89,7 +96,23 @@ export async function fetchAnlasBalance({ baseUrl, apiKey, signal } = {}) {
     const fixed = Number(left?.fixedTrainingStepsLeft);
     const purchased = Number(left?.purchasedTrainingSteps);
     if (!Number.isFinite(fixed) && !Number.isFinite(purchased)) return null;
-    return (Number.isFinite(fixed) ? fixed : 0) + (Number.isFinite(purchased) ? purchased : 0);
+    const subscription = Number.isFinite(fixed) ? fixed : 0;
+    const paid = Number.isFinite(purchased) ? purchased : 0;
+    return {
+      active: !!data?.active,
+      tier: data?.tier ?? null,
+      expiresAt: Number(data?.expiresAt) || 0,
+      usage: {
+        percent: Number(data?.usage?.percent) || 0,
+        isNegative: !!data?.usage?.isNegative,
+        timeUntilNextPercent: Number(data?.usage?.timeUntilNextPercent) || 0,
+      },
+      trainingStepsLeft: {
+        fixedTrainingStepsLeft: subscription,
+        purchasedTrainingSteps: paid,
+      },
+      anlas: { subscription, purchased: paid, total: subscription + paid },
+    };
   } catch {
     return null;
   }

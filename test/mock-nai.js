@@ -31,6 +31,8 @@ export function createMockApp() {
     callTimes: [], // 每次进入 generate 的时间戳
     seen: new Map(), // MOCK_429xN 的计数
     balance: 10000,
+    purchasedBalance: 0,
+    batteryPercent: 100,
     subscriptionEnabled: true,
   };
 
@@ -62,7 +64,12 @@ export function createMockApp() {
       const zip = new JSZip();
       for (let i = 0; i < count; i++) zip.file(`image_${i}.png`, PNG_1x1);
       const buf = await zip.generateAsync({ type: 'nodebuffer' });
-      state.balance -= 7;
+      const freeV5 = /^nai-diffusion-5-/.test(String(req.body?.model || ''))
+        && !req.body?.parameters?.image
+        && Number(req.body?.parameters?.n_samples || 1) === 1
+        && Number(req.body?.parameters?.steps || 0) <= 28;
+      if (freeV5 && state.batteryPercent > 0) state.batteryPercent = Math.max(0, state.batteryPercent - 1);
+      else state.balance -= 7;
       res.set('Content-Type', 'application/zip');
       res.send(buf);
     } finally {
@@ -87,7 +94,20 @@ export function createMockApp() {
 
   app.get('/user/subscription', (req, res) => {
     if (!state.subscriptionEnabled) return res.status(503).json({ error: 'mock subscription disabled' });
-    res.json({ trainingStepsLeft: { fixedTrainingStepsLeft: state.balance, purchasedTrainingSteps: 0 } });
+    res.json({
+      active: true,
+      tier: 3,
+      expiresAt: Math.floor(Date.now() / 1000) + 30 * 86_400,
+      usage: {
+        percent: state.batteryPercent,
+        isNegative: state.batteryPercent <= 0,
+        timeUntilNextPercent: state.batteryPercent >= 100 ? 0 : 6048,
+      },
+      trainingStepsLeft: {
+        fixedTrainingStepsLeft: state.balance,
+        purchasedTrainingSteps: state.purchasedBalance,
+      },
+    });
   });
 
   app.get('/mock/stats', (req, res) => {
@@ -97,6 +117,7 @@ export function createMockApp() {
       concurrencyViolation: state.concurrencyViolation,
       callTimes: state.callTimes,
       balance: state.balance,
+      batteryPercent: state.batteryPercent,
     });
   });
   app.post('/mock/reset', (req, res) => {
@@ -106,12 +127,18 @@ export function createMockApp() {
     state.callTimes = [];
     state.seen.clear();
     state.balance = 10000;
+    state.purchasedBalance = 0;
+    state.batteryPercent = 100;
     state.subscriptionEnabled = true;
     res.json({ ok: true });
   });
   app.post('/mock/subscription/:state', (req, res) => {
     state.subscriptionEnabled = req.params.state !== 'off';
     res.json({ enabled: state.subscriptionEnabled });
+  });
+  app.post('/mock/battery/:percent', (req, res) => {
+    state.batteryPercent = Math.max(0, Math.min(100, Number(req.params.percent) || 0));
+    res.json({ percent: state.batteryPercent });
   });
 
   app._state = state;
