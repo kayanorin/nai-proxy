@@ -75,7 +75,7 @@ V5 普通单张请求默认使用 `X-Spend-Policy: free-only`。电量不足时�
 | `RESULT_TTL_MS` | `600000` | 结果保留时长（10 分钟），超时回收 |
 | `MAX_SAMPLES` / `MAX_STEPS` | `0` | 参数上限，0=不限制 |
 | `NAI_BASE_URL` | NAI 真地址 | 测试时指向本地 mock |
-| `NAI_API_BASE_URL` | `https://api.novelai.net` | NAI 账号接口（查 Anlas 余额），与生图不同域名 |
+| `NAI_API_BASE_URL` | `https://image.novelai.net` | NAI 订阅与额度接口（查 V5 电量及 Anlas） |
 | `MAX_JOBS` | `200` | 内存里最多保留多少 job |
 | `PORT` | `3000` | Render 自动注入 |
 | `STATS_DB_PATH` | `./data/stats.sqlite` | 活动与公平资源账本的 SQLite 路径；生产环境必须放在持久卷 |

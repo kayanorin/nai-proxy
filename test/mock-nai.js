@@ -107,7 +107,7 @@ export function createMockApp() {
     }
   });
 
-  // 账号接口：查 Anlas 余额（真服务在 api.novelai.net，测试里与生图共用一个 mock）
+  // 订阅接口：查 V5 电量与 Anlas（真服务在 image.novelai.net，测试里共用一个 mock）
   app.get('/user/subscription', (req, res) => {
     if (!state.subscriptionEnabled || state.subscriptionDown) {
       return res.status(503).json({ error: 'mock subscription disabled' });

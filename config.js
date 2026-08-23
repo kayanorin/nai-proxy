@@ -41,8 +41,8 @@ export function loadConfig(env = process.env) {
 
     // NAI 接口基址，默认真地址；测试时指向本地 mock
     naiBaseUrl: env.NAI_BASE_URL || 'https://image.novelai.net',
-    // NAI 账号接口基址（查 Anlas 余额用；与生图不是同一个域名）
-    naiApiBaseUrl: env.NAI_API_BASE_URL || 'https://api.novelai.net',
+    // NAI 订阅/额度接口已迁到 image host；旧 api host 会要求客户端改用 image URL。
+    naiApiBaseUrl: env.NAI_API_BASE_URL || 'https://image.novelai.net',
 
     // 429 / 网络错误重试参数（沿用客户端原来 10 次的思路）
     retry: {
