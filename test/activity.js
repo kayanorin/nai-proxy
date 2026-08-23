@@ -30,6 +30,7 @@ try {
   const west = store.querySelf('west-token', 7);
   assert(west.hours[1].count === 3, `DST hour should contain 3, got ${west.hours[1].count}`);
   assert(west.totals.requests === 3 && west.totals.anlas === 10, 'West totals mismatch');
+  assert(west.totals.operations.generate === 2 && west.totals.operations['encode-vibe'] === 1, 'Operation totals mismatch');
   const east = store.querySelf('east-token', 7);
   assert(east.hours[0].count === 1, 'Shanghai local hour should be 0');
   assert(store.querySelf('utc-token', 7).hours[12].count === 1, 'UTC local hour should be 12');

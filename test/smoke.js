@@ -123,6 +123,21 @@ async function encodeVibe(base, body, token = 'tok1') {
     body: JSON.stringify(body),
   });
 }
+async function upscale(base, { width = 800, height = 800, allowAnlas = false } = {}, token = 'tok1') {
+  const pngHeader = Buffer.alloc(24);
+  Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]).copy(pngHeader, 0);
+  pngHeader.writeUInt32BE(width, 16);
+  pngHeader.writeUInt32BE(height, 20);
+  return fetch(base + '/upscale', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-Access-Token': token,
+      'X-Spend-Policy': allowAnlas ? 'allow-anlas' : 'free-only',
+    },
+    body: JSON.stringify({ image: pngHeader.toString('base64'), model: 'nai-diffusion-5-full', declared_blur_sigma: 0.4, source_width: 1, source_height: 1 }),
+  });
+}
 async function submitId(base, body, token = 'tok1') {
   const r = await submit(base, body, token);
   const j = await r.json();
@@ -161,6 +176,15 @@ await test('健康检查 + CORS 预检', () =>
     const allow = opt.headers.get('access-control-allow-headers') || '';
     assert(allow.includes('X-Access-Token'), 'CORS 应允许 X-Access-Token');
     assert(allow.toLowerCase().includes('authorization'), 'CORS 应允许 Authorization（NAI 兼容端点必需）');
+  }));
+
+await test('能力接口声明 V5 核心图像工作流', () =>
+  withProxy({}, async ({ base }) => {
+    const r = await fetch(base + '/capabilities', { headers: { 'X-Access-Token': 'tok1' } });
+    assert(r.status === 200, `能力接口应 200，实际 ${r.status}`);
+    const data = await r.json();
+    assert(data.operations.includes('upscale'), '能力接口应包含 upscale');
+    assert(data.models['nai-diffusion-5-curated'].inpaint === 'fallback', 'V5 Curated 重绘应标为 fallback');
   }));
 
 await test('无令牌 / 错令牌 → 401', () =>
@@ -330,6 +354,25 @@ await test('encode-vibe：鉴权与字段校验', () =>
     assert(noToken.status === 401, `无令牌应 401，实际 ${noToken.status}`);
     const bad = await fetch(base + '/encode-vibe', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Access-Token': 'tok1' }, body: '{}' });
     assert(bad.status === 400, `缺字段应 400，实际 ${bad.status}`);
+  }));
+
+await test('upscale：大图先确认 Anlas，再经队列取 zip', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    const invalid = await fetch(base + '/upscale', { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Access-Token': 'tok1' }, body: JSON.stringify({ image: 'AAAA', model: 'nai-diffusion-5-full' }) });
+    assert(invalid.status === 400 && (await invalid.json()).code === 'BAD_IMAGE', '无效图片应在服务端拒绝');
+    const oversized = await upscale(base, { width: 1200, height: 800, allowAnlas: true });
+    assert(oversized.status === 400 && (await oversized.json()).code === 'UPSCALE_INPUT_TOO_LARGE', '超规格图片应在服务端拒绝');
+    const denied = await upscale(base, { width: 800, height: 800, allowAnlas: false });
+    assert(denied.status === 409, `未确认应 409，实际 ${denied.status}`);
+    assert((await denied.json()).code === 'ANLAS_CONFIRM_REQUIRED', '应返回确认错误码');
+    const accepted = await upscale(base, { width: 800, height: 800, allowAnlas: true });
+    assert(accepted.status === 200, `确认后应入队，实际 ${accepted.status}`);
+    const sub = await accepted.json();
+    const done = await waitJob(base, sub.job_id);
+    assert(done.status === 'done', `应 done，实际 ${done.status} ${done.error || ''}`);
+    assert(done.anlas_actual === 4, `upscale 实测应 4，实际 ${done.anlas_actual}`);
+    const rr = await fetch(base + '/result/' + sub.job_id, { headers: { 'X-Access-Token': 'tok1' } });
+    assert((rr.headers.get('content-type') || '').includes('zip'), 'upscale 应返回 zip');
   }));
 
 await test('实测记账 + GET /balance', () =>

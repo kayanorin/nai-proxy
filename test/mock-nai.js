@@ -27,6 +27,7 @@ export const MOCK_VIBE_BYTES = Buffer.from([0x4d, 0x4f, 0x43, 0x4b, 0x56, 0x49, 
 
 // 假余额里一次生图的扣点（随便取的固定值，只要与估算不同就能验出记的是实测值）
 export const MOCK_GENERATE_COST = 7;
+export const MOCK_UPSCALE_COST = 4;
 
 export function createMockApp() {
   const app = express();
@@ -35,6 +36,7 @@ export function createMockApp() {
   const state = {
     calls: 0,
     encodeCalls: 0,
+    upscaleCalls: 0,
     inflight: 0,
     // 假余额：generate-image 每次扣 GENERATE_COST，encode-vibe 扣 2（验「实测差值」口径）
     balance: 10000,
@@ -102,6 +104,25 @@ export function createMockApp() {
       state.balance -= 2;
       res.set('Content-Type', 'application/octet-stream');
       res.send(MOCK_VIBE_BYTES);
+    } finally {
+      state.inflight--;
+    }
+  });
+
+  app.post('/ai/upscale', async (req, res) => {
+    state.calls++;
+    state.callTimes.push(Date.now());
+    state.inflight++;
+    state.maxInflight = Math.max(state.maxInflight, state.inflight);
+    if (state.inflight > 1) state.concurrencyViolation = true;
+    try {
+      await delay(40);
+      state.upscaleCalls++;
+      state.balance -= MOCK_UPSCALE_COST;
+      const zip = new JSZip();
+      zip.file('upscaled.png', PNG_1x1);
+      res.set('Content-Type', 'application/zip');
+      res.send(await zip.generateAsync({ type: 'nodebuffer' }));
     } finally {
       state.inflight--;
     }

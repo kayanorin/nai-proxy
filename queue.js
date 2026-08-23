@@ -38,7 +38,7 @@ export class JobQueue {
     this._reaper = null;
   }
 
-  // kind：'generate'（生图）| 'encode-vibe'（vibe 编码）。决定 worker 打哪个 NAI 接口、用哪档限速，
+  // kind：generate/img2img/inpaint/enhance/upscale/encode-vibe。决定转发端点、活动分类与限速，
   // 所以必须在入队时就定下来——worker 可能在 submit() 返回前就已经开跑。
   submit(token, body, kind = 'generate') {
     const id = randomUUID();

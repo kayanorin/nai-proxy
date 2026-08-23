@@ -33,7 +33,9 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `GET /result/:id` | 是 | done 时回 `application/zip` 原始字节；未完成 409 |
 | `POST /cancel/:id` | 是 | 排队中直接移除；运行中 Abort 中断 |
 | `POST /encode-vibe` | 是 | Vibe 编码任务；进入同一队列，完成后由 `/result/:id` 返回原始字节 |
+| `POST /upscale` | 是 | 独立 4× Upscale；服务端读取真实图片尺寸，大图要求 `allow-anlas`，结果由 `/result/:id` 返回 |
 | `GET /balance` | 是 | 当前 Anlas 余额（短时缓存；不可用时返回 `null`） |
+| `GET /capabilities` | 是 | 客户端能力发现：可用工作流、V5 Full/Curated 重绘状态与 Upscale 尺寸限制 |
 | `GET /resources/me` | 是 | 当前朋友的 V5 电量、个人/共享池、借用债务、两类 Anlas 与到期状态 |
 | `GET /resources` | 管理员 | 全部资源池、匿名用户账本、共享量、债务与安全线 |
 | `POST /resources/pause-paid` | 管理员 | 紧急暂停/恢复所有付费 Anlas 消耗 |
@@ -42,12 +44,16 @@ GET /result/:id <──zip──────   done 后原样吐回 NAI 的 zip 
 | `GET /stats/activity?days=7&user=all` | 管理员 | 全体或单用户活动；`X-Access-Token` 使用 `ADMIN_TOKEN` |
 | `GET /stats/ui` | 页面公开，数据需管理员 | 车主活动统计页面；管理员令牌只保存在浏览器本地 |
 | `POST /ai/generate-image` | 是* | **NAI 原生兼容**：同步生图（入同一队列、阻塞等出图、原样回 zip/msgpack）。给只能填 NAI key 的第三方客户端用（如酒馆插件） |
+| `POST /ai/upscale` | 是* | 独立 Upscale 的同步兼容端点；同样进入公平队列 |
 
 鉴权：网页端用请求头 `X-Access-Token: <你的令牌>`。任务与提交它的令牌绑定，他人令牌查不到（403）。
 
 V5 普通单张请求默认使用 `X-Spend-Policy: free-only`。电量不足时服务返回
 `V5_ANLAS_CONFIRM_REQUIRED`，客户端必须让当前用户明确选择后，以
 `X-Spend-Policy: allow-anlas` 重新提交；不带该头不会消耗 Anlas。
+
+独立 Upscale 对输入图片最大边做服务端校验（不信任客户端上报尺寸）：不超过
+640×640 的 Opus 请求可免费执行，其余先返回 `ANLAS_CONFIRM_REQUIRED`，明确确认后才入队。
 
 > \* `/ai/generate-image` 例外：它从 `Authorization: Bearer <令牌>` 读令牌（也兼容 `X-Access-Token`），因为第三方客户端通常只有「NAI key」一个输入框——把**访问令牌**填进去即可。
 

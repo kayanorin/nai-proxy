@@ -118,8 +118,8 @@ export class ActivityStore {
     const now = this.now();
     const from = now - days * DAY_MS;
     const rows = userId === 'all'
-      ? this.db.prepare('SELECT user_id, bucket_utc, request_count, anlas, v5_free, battery_borrowed, subscription_anlas, purchased_anlas FROM activity_hourly WHERE bucket_utc >= ?').all(from)
-      : this.db.prepare('SELECT user_id, bucket_utc, request_count, anlas, v5_free, battery_borrowed, subscription_anlas, purchased_anlas FROM activity_hourly WHERE user_id = ? AND bucket_utc >= ?').all(userId, from);
+      ? this.db.prepare('SELECT user_id, bucket_utc, kind, request_count, anlas, v5_free, battery_borrowed, subscription_anlas, purchased_anlas FROM activity_hourly WHERE bucket_utc >= ?').all(from)
+      : this.db.prepare('SELECT user_id, bucket_utc, kind, request_count, anlas, v5_free, battery_borrowed, subscription_anlas, purchased_anlas FROM activity_hourly WHERE user_id = ? AND bucket_utc >= ?').all(userId, from);
     const hours = Array.from({ length: 24 }, (_, hour) => ({ hour, count: 0 }));
     let requests = 0;
     let anlas = 0;
@@ -127,6 +127,7 @@ export class ActivityStore {
     let batteryBorrowed = 0;
     let subscriptionAnlas = 0;
     let purchasedAnlas = 0;
+    const operations = {};
     for (const row of rows) {
       const profile = this.profilesById.get(row.user_id);
       if (!profile) continue;
@@ -138,6 +139,7 @@ export class ActivityStore {
       batteryBorrowed += Number(row.battery_borrowed) || 0;
       subscriptionAnlas += Number(row.subscription_anlas) || 0;
       purchasedAnlas += Number(row.purchased_anlas) || 0;
+      operations[row.kind || 'generate'] = (operations[row.kind || 'generate'] || 0) + (Number(row.request_count) || 0);
     }
     const profile = userId === 'all' ? null : this.profilesById.get(userId);
     const out = {
@@ -146,7 +148,7 @@ export class ActivityStore {
       scope: profile
         ? { id: profile.id, name: profile.name, timeZone: profile.timeZone }
         : { id: 'all', name: 'All users', timeZone: 'local-per-user' },
-      totals: { requests, anlas, v5Free, batteryBorrowed, subscriptionAnlas, purchasedAnlas },
+      totals: { requests, anlas, v5Free, batteryBorrowed, subscriptionAnlas, purchasedAnlas, operations },
       hours,
     };
     if (includeUsers) {

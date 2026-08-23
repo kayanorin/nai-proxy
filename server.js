@@ -112,10 +112,15 @@ export function createApp(config) {
           throw e;
         }
       }
+      const naiPath = job.kind === 'encode-vibe'
+        ? '/ai/encode-vibe'
+        : job.kind === 'upscale'
+          ? '/ai/upscale'
+          : '/ai/generate-image';
       const result = await callNAIWithRetry(job.body, {
         baseUrl: config.naiBaseUrl,
         apiKey: config.naiKey,
-        path: job.kind === 'encode-vibe' ? '/ai/encode-vibe' : '/ai/generate-image',
+        path: naiPath,
         signal,
         ...config.retry,
       });
@@ -195,6 +200,18 @@ export function createApp(config) {
     });
   });
 
+  app.get('/capabilities', auth, (req, res) => {
+    res.json({
+      version: 1,
+      operations: ['generate', 'img2img', 'inpaint', 'enhance', 'upscale', 'encode-vibe'],
+      models: {
+        'nai-diffusion-5-full': { inpaint: 'supported', vibe: 'paused', preciseReference: 'paused' },
+        'nai-diffusion-5-curated': { inpaint: 'fallback', vibe: 'paused', preciseReference: 'paused' },
+      },
+      upscale: { factor: 4, maxInputWidth: 1024, maxInputHeight: 1024, opusFreeMaxWidth: 640, opusFreeMaxHeight: 640 },
+    });
+  });
+
   // ---- 诊断：本服务出口 IP（验「单一 IP」用）----
   app.get('/egress-ip', async (req, res) => {
     try {
@@ -206,7 +223,35 @@ export function createApp(config) {
     }
   });
 
-  async function prepareBilling(req, res, body) {
+  async function prepareBilling(req, res, body, kind = 'generate', sourceSize = null) {
+    if (kind === 'upscale') {
+      const subscription = await refreshResources();
+      const spendPolicy = String(req.get('X-Spend-Policy') || '').toLowerCase();
+      const free = !!config.opusFree && Number(sourceSize?.width) > 0 && Number(sourceSize?.height) > 0
+        && Number(sourceSize.width) <= 640 && Number(sourceSize.height) <= 640;
+      if (free) return { mode: 'upscale-free', anlasEst: 0 };
+      if (spendPolicy !== 'allow-anlas') {
+        res.status(409).json({
+          error: '这张图片的独立放大需要使用 Anlas，请明确确认后继续',
+          code: 'ANLAS_CONFIRM_REQUIRED',
+          anlas_est: null,
+          resources: subscription ? resources.forToken(req.token) : null,
+        });
+        return null;
+      }
+      if (subscription) {
+        const gate = resources.canSpendAnlas(req.token, 1);
+        if (!gate.ok) {
+          res.status(gate.reason === 'paused' ? 423 : 402).json({
+            error: gate.reason === 'paused' ? '共享 Anlas 消耗已被车主暂停' : '个人与共享 Anlas 均不足',
+            code: gate.reason === 'paused' ? 'ANLAS_PAUSED' : 'INSUFFICIENT_SHARED_ANLAS',
+            anlas_est: null,
+          });
+          return null;
+        }
+      }
+      return { mode: 'anlas-confirmed', anlasEst: null };
+    }
     const freeV5 = isFreeV5Request(body) && config.opusFree;
     const subscription = await refreshResources();
     const spendPolicy = String(req.get('X-Spend-Policy') || '').toLowerCase();
@@ -284,7 +329,7 @@ export function createApp(config) {
     clampBody(body, config);
     const billing = await prepareBilling(req, res, body);
     if (!billing) return;
-    const id = queue.submit(req.token, body, 'generate');
+    const id = queue.submit(req.token, body, generationKind(body));
     const job = queue.get(id);
     job.anlasEst = billing.anlasEst;
     job.billingMode = billing.mode;
@@ -297,6 +342,30 @@ export function createApp(config) {
       anlas_est: job.anlasEst,
       billing_mode: job.billingMode,
     });
+  });
+
+  // ---- 独立 4× Upscale（同一公平队列；大于 640×640 时必须显式允许 Anlas）----
+  app.post('/upscale', auth, async (req, res) => {
+    const raw = req.body;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !raw.image || !raw.model) {
+      return res.status(400).json({ error: 'body 需要 image / model', code: 'BAD_BODY' });
+    }
+    const sourceSize = imageDimensionsFromBase64(raw.image);
+    if (!sourceSize) return res.status(400).json({ error: '无法读取图片尺寸，请改用 PNG / JPEG / WebP / GIF', code: 'BAD_IMAGE' });
+    if (sourceSize.width > 1024 || sourceSize.height > 1024) {
+      return res.status(400).json({ error: '独立放大只支持不超过 1024×1024 的图片', code: 'UPSCALE_INPUT_TOO_LARGE' });
+    }
+    if (!config.naiKey) return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
+    const billing = await prepareBilling(req, res, raw, 'upscale', sourceSize);
+    if (!billing) return;
+    const body = { image: raw.image, model: raw.model, declared_blur_sigma: Number(raw.declared_blur_sigma) || 0 };
+    const id = queue.submit(req.token, body, 'upscale');
+    const job = queue.get(id);
+    job.anlasEst = billing.anlasEst;
+    job.billingMode = billing.mode;
+    job.sourceSize = sourceSize;
+    const position = queue.position(id);
+    res.json({ job_id: id, status: 'queued', position, eta_ms: etaMs(position, averageGapMs(config.minGapMs, config.maxGapMs)), anlas_est: null, billing_mode: job.billingMode });
   });
 
   // ---- 轮询状态 ----
@@ -440,7 +509,7 @@ export function createApp(config) {
     clampBody(body, config);
     const billing = await prepareBilling(req, res, body);
     if (!billing) return;
-    const id = queue.submit(req.token, body, 'generate');
+    const id = queue.submit(req.token, body, generationKind(body));
     const job = queue.get(id);
     job.anlasEst = billing.anlasEst;
     job.billingMode = billing.mode;
@@ -465,6 +534,35 @@ export function createApp(config) {
     return res
       .status(naiErrStatus(job.errorCode))
       .json({ error: job.error || 'NAI 生成失败', code: job.errorCode || 'ERROR', ...(job.errorDetails || {}) });
+  });
+
+  app.post('/ai/upscale', naiCompatAuth, async (req, res) => {
+    const raw = req.body;
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw) || !raw.image || !raw.model) {
+      return res.status(400).json({ error: 'body 需要 image / model', code: 'BAD_BODY' });
+    }
+    const sourceSize = imageDimensionsFromBase64(raw.image);
+    if (!sourceSize) return res.status(400).json({ error: '无法读取图片尺寸，请改用 PNG / JPEG / WebP / GIF', code: 'BAD_IMAGE' });
+    if (sourceSize.width > 1024 || sourceSize.height > 1024) {
+      return res.status(400).json({ error: '独立放大只支持不超过 1024×1024 的图片', code: 'UPSCALE_INPUT_TOO_LARGE' });
+    }
+    const billing = await prepareBilling(req, res, raw, 'upscale', sourceSize);
+    if (!billing) return;
+    const body = { image: raw.image, model: raw.model, declared_blur_sigma: Number(raw.declared_blur_sigma) || 0 };
+    const id = queue.submit(req.token, body, 'upscale');
+    const job = queue.get(id);
+    job.anlasEst = billing.anlasEst;
+    job.billingMode = billing.mode;
+    let settled = false;
+    res.on('close', () => { if (!settled) queue.cancel(id); });
+    await queue.waitFor(id);
+    settled = true;
+    if (job.status === 'done') {
+      res.set('Content-Type', job.contentType || 'application/zip');
+      return res.send(job.resultBuf);
+    }
+    if (job.status === 'cancelled') return res.status(499).json({ error: '任务已取消', code: 'CANCELLED' });
+    return res.status(naiErrStatus(job.errorCode)).json({ error: job.error || 'NAI 放大失败', code: job.errorCode || 'ERROR', ...(job.errorDetails || {}) });
   });
 
   // ---- 用量统计（车主专用，设了 ADMIN_TOKEN 才开；朋友令牌看不到）----
@@ -556,6 +654,60 @@ function notFound(res) {
 }
 function forbidden(res) {
   return res.status(403).json({ error: '无权访问该任务', code: 'FORBIDDEN' });
+}
+
+function generationKind(body) {
+  if (body?.parameters?.upscaled_enhance) return 'enhance';
+  if (body?.action === 'infill') return 'inpaint';
+  if (body?.action === 'img2img' || body?.parameters?.image) return 'img2img';
+  return 'generate';
+}
+
+function imageDimensionsFromBase64(value) {
+  try {
+    const raw = String(value || '').replace(/^data:[^,]+,/, '');
+    const b = Buffer.from(raw, 'base64');
+    if (b.length >= 24 && b.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+      return validSize(b.readUInt32BE(16), b.readUInt32BE(20));
+    }
+    if (b.length >= 10 && (b.subarray(0, 6).toString('ascii') === 'GIF87a' || b.subarray(0, 6).toString('ascii') === 'GIF89a')) {
+      return validSize(b.readUInt16LE(6), b.readUInt16LE(8));
+    }
+    if (b.length >= 16 && b.subarray(0, 4).toString('ascii') === 'RIFF' && b.subarray(8, 12).toString('ascii') === 'WEBP') {
+      const kind = b.subarray(12, 16).toString('ascii');
+      if (kind === 'VP8X' && b.length >= 30) return validSize(1 + readUInt24LE(b, 24), 1 + readUInt24LE(b, 27));
+      if (kind === 'VP8L' && b.length >= 25) {
+        const b1 = b[21], b2 = b[22], b3 = b[23], b4 = b[24];
+        return validSize(1 + b1 + ((b2 & 0x3f) << 8), 1 + (b2 >> 6) + (b3 << 2) + ((b4 & 0x0f) << 10));
+      }
+      if (kind === 'VP8 ' && b.length >= 30) return validSize(b.readUInt16LE(26) & 0x3fff, b.readUInt16LE(28) & 0x3fff);
+    }
+    if (b.length >= 4 && b[0] === 0xff && b[1] === 0xd8) {
+      let i = 2;
+      while (i + 9 < b.length) {
+        if (b[i] !== 0xff) { i++; continue; }
+        const marker = b[i + 1];
+        if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+          return validSize(b.readUInt16BE(i + 7), b.readUInt16BE(i + 5));
+        }
+        if (marker === 0xd8 || marker === 0xd9) { i += 2; continue; }
+        const len = b.readUInt16BE(i + 2);
+        if (len < 2) break;
+        i += len + 2;
+      }
+    }
+  } catch {}
+  return null;
+}
+
+function readUInt24LE(buffer, offset) {
+  return buffer[offset] | (buffer[offset + 1] << 8) | (buffer[offset + 2] << 16);
+}
+
+function validSize(width, height) {
+  return Number.isInteger(width) && Number.isInteger(height) && width > 0 && height > 0
+    ? { width, height }
+    : null;
 }
 
 // NAI 失败码 → 对外 HTTP 状态（给 NAI 原生兼容端点用）。
