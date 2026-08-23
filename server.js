@@ -113,8 +113,8 @@ export function createApp(config) {
       const result = await callNAIWithRetry(job.body, {
         baseUrl: config.naiBaseUrl,
         apiKey: config.naiKey,
-        signal,
         path: job.kind === 'encode-vibe' ? '/ai/encode-vibe' : '/ai/generate-image',
+        signal,
         ...config.retry,
       });
       const afterSubscription = await readSubscription(signal);
@@ -132,11 +132,12 @@ export function createApp(config) {
     // 任务结束回调：只对成功(done)计点，并写一条结构化用量日志（车主看 Render 日志长期对账）
     onSettled: (job) => {
       if (job.status !== 'done') return;
-      const anlas = typeof job.anlasActual === 'number'
-        ? job.anlasActual
-        : typeof job.anlasEst === 'number'
-          ? job.anlasEst
-          : estimateAnlas(job.body, { opus: config.opusFree });
+      const anlas =
+        typeof job.anlasActual === 'number'
+          ? job.anlasActual
+          : typeof job.anlasEst === 'number'
+            ? job.anlasEst
+            : estimateAnlas(job.body, { opus: config.opusFree });
       stats.record(job.token, anlas);
       activity.record(job.token, {
         at: job.createdAt,
@@ -152,6 +153,7 @@ export function createApp(config) {
       console.log(JSON.stringify({
         evt: 'usage',
         at: new Date().toISOString(),
+        // 记稳定的 userId 而不是原始访问令牌：日志会长期留在 Render 上，别把令牌写进去
         userId: profile?.id || 'unknown',
         model: job.body && job.body.model,
         size: `${p.width || '?'}x${p.height || '?'}`,
@@ -305,7 +307,13 @@ export function createApp(config) {
       job_id: job.id,
       status: job.status,
       position,
-      eta_ms: etaMs(position, averageGapMs(config.minGapMs, config.maxGapMs)),
+      // 生图的间隔是随机的，预估用区间均值；vibe 编码走自己那档固定间隔
+      eta_ms: etaMs(
+        position,
+        job.kind === 'encode-vibe'
+          ? config.encodeMinGapMs
+          : averageGapMs(config.minGapMs, config.maxGapMs)
+      ),
       anlas_est: typeof job.anlasEst === 'number'
         ? job.anlasEst
         : estimateAnlas(job.body, { opus: config.opusFree }),
@@ -329,7 +337,8 @@ export function createApp(config) {
         .json({ error: '任务尚未完成', status: job.status, code: job.errorCode || null });
     }
     res.set('Content-Type', job.contentType || 'application/zip');
-    if ((job.contentType || '').includes('zip')) {
+    // 只有 zip（生图结果）才当附件下载；vibe 编码结果是裸字节，前端直接读
+    if (/zip/i.test(job.contentType || 'application/zip')) {
       res.set('Content-Disposition', 'attachment; filename="result.zip"');
     }
     res.send(job.resultBuf);
@@ -347,9 +356,16 @@ export function createApp(config) {
   // ---- Vibe 编码（同一串行队列，裸字节返回）----
   app.post('/encode-vibe', auth, async (req, res) => {
     const body = req.body;
-    if (!config.naiKey) return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
-    if (!body || typeof body !== 'object' || !body.image || !body.information_extracted || !body.model) {
-      return res.status(400).json({ error: 'body 缺少 image / information_extracted / model', code: 'BAD_BODY' });
+    if (!body || typeof body !== 'object' || Array.isArray(body)) {
+      return res.status(400).json({ error: 'body 必须是 NAI 请求的 JSON 对象', code: 'BAD_BODY' });
+    }
+    if (body.image == null || body.information_extracted == null || !body.model) {
+      return res
+        .status(400)
+        .json({ error: 'body 需要 image / information_extracted / model 三个字段', code: 'BAD_BODY' });
+    }
+    if (!config.naiKey) {
+      return res.status(503).json({ error: '服务端未配置 NAI_KEY', code: 'NO_KEY' });
     }
     const subscription = await refreshResources();
     if (subscription) {
@@ -365,7 +381,13 @@ export function createApp(config) {
     job.anlasEst = 2;
     job.billingMode = 'anlas';
     const position = queue.position(id);
-    res.json({ job_id: id, status: 'queued', position, eta_ms: etaMs(position, config.encodeMinGapMs), anlas_est: 2 });
+    res.json({
+      job_id: id,
+      status: 'queued',
+      position,
+      eta_ms: etaMs(position, config.encodeMinGapMs),
+      anlas_est: job.anlasEst,
+    });
   });
 
   // ---- 当前 Anlas 余额（60 秒缓存）----

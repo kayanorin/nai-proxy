@@ -8,9 +8,11 @@ import { randomUUID } from 'node:crypto';
 export class JobQueue {
   /**
    * @param {object} opts
-   * @param {(body:object, signal:AbortSignal)=>Promise<{buf:Buffer,contentType:string}>} opts.runner
+   * @param {(job:object, signal:AbortSignal)=>Promise<{buf:Buffer,contentType:string}>} opts.runner
    * @param {number} [opts.minGapMs]
-   * @param {number} [opts.maxGapMs]
+   * @param {number} [opts.maxGapMs]        生图间隔上界；每单在 [minGapMs, maxGapMs] 内独立抽取
+   * @param {number} [opts.encodeMinGapMs]  vibe 编码任务的间隔（比生图便宜快，可以更密）
+   * @param {number} [opts.random]          取随机数的函数，测试里可注入固定值
    * @param {number} [opts.resultTtlMs]
    * @param {number} [opts.maxJobs]
    */
@@ -36,6 +38,8 @@ export class JobQueue {
     this._reaper = null;
   }
 
+  // kind：'generate'（生图）| 'encode-vibe'（vibe 编码）。决定 worker 打哪个 NAI 接口、用哪档限速，
+  // 所以必须在入队时就定下来——worker 可能在 submit() 返回前就已经开跑。
   submit(token, body, kind = 'generate') {
     const id = randomUUID();
     const job = {
@@ -131,9 +135,13 @@ export class JobQueue {
           continue;
         }
 
-        // 生图任务每次独立抽取间隔；Vibe 编码保留自己的固定间隔。
-        const gapMs = job.kind === 'encode-vibe' ? this.encodeMinGapMs : this._nextGenerateGapMs();
-        const wait = gapMs - (Date.now() - this.lastStartAt);
+        // 限速：与上次请求起点间隔 ≥ 该类型的最小间隔。
+        // 生图每单在 [minGapMs, maxGapMs] 内独立抽取；vibe 编码用自己的固定间隔。
+        const gap =
+          job.kind === 'encode-vibe' && this.encodeMinGapMs != null
+            ? this.encodeMinGapMs
+            : this._nextGenerateGapMs();
+        const wait = gap - (Date.now() - this.lastStartAt);
         if (wait > 0) await sleep(wait);
 
         // 等待期间可能被取消

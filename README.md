@@ -70,12 +70,12 @@ V5 普通单张请求默认使用 `X-Spend-Policy: free-only`。电量不足时�
 | `NAI_KEY` | （空） | 共享 NAI token。**换 key = 改这里**（这就是「填 key 的位置」） |
 | `ACCESS_TOKENS` | （空） | 逗号分隔的访问令牌，一人一个 |
 | `MIN_GAP_MS` | `8000` | 生图请求随机起点间隔的下限 |
-| `MAX_GAP_MS` | `12000` | 生图请求随机起点间隔的上限 |
-| `ENCODE_MIN_GAP_MS` | `3000` | Vibe 编码任务的最小起点间隔 |
+| `MAX_GAP_MS` | `12000` | 生图请求随机起点间隔的上限（每单在上下限之间独立抽取） |
+| `ENCODE_MIN_GAP_MS` | `3000` | vibe 编码任务的间隔（比生图轻，可以更密；仍走同一条串行队列） |
 | `RESULT_TTL_MS` | `600000` | 结果保留时长（10 分钟），超时回收 |
 | `MAX_SAMPLES` / `MAX_STEPS` | `0` | 参数上限，0=不限制 |
 | `NAI_BASE_URL` | NAI 真地址 | 测试时指向本地 mock |
-| `NAI_API_BASE_URL` | `NAI_BASE_URL` / NAI image host | 查询余额；测试时指向本地 mock |
+| `NAI_API_BASE_URL` | `https://api.novelai.net` | NAI 账号接口（查 Anlas 余额），与生图不同域名 |
 | `MAX_JOBS` | `200` | 内存里最多保留多少 job |
 | `PORT` | `3000` | Render 自动注入 |
 | `STATS_DB_PATH` | `./data/stats.sqlite` | 活动与公平资源账本的 SQLite 路径；生产环境必须放在持久卷 |
@@ -83,6 +83,14 @@ V5 普通单张请求默认使用 `X-Spend-Policy: free-only`。电量不足时�
 | `USER_PROFILES_JSON` | `{}` | 访问令牌到显示名与 IANA 时区的 JSON 映射 |
 
 完整清单见 [.env.example](.env.example)。
+
+## 用量统计口径
+
+**记账以实测为准**：每个任务开跑前后各查一次 NAI 余额，差值就是这一单的真实扣点（队列串行，同一 key 上没有并发任务，归因是准的）。这样局部重绘、precise 参考、vibe 编码等一切计费项都自动算进去，也不会因 NAI 改价而失真。
+
+`anlas.js` 的估算公式只用于两处：提交时给出预估显示、余额查不到时的记账回落。它已对齐官网前端的算法（img2img/局部重绘按 `strength` 折算且单张最低 2 点；precise 参考每张 5 点 × 张数且 Opus 免费档不豁免；vibe 引用第 5 个起每个 +2）。
+
+> 注意：Opus 免费档内（≤1024×1024、≤28 步、单张）的生图与局部重绘本来就是 0 点，统计记 0 是对的，不是漏记。车主自己在 NAI 网页上与代理同时出图会污染差值——罕见，接受。
 
 ## 本地运行
 

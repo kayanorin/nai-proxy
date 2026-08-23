@@ -7,6 +7,9 @@
 //   input 含 MOCK_429      → 每次都 429（验重试耗尽）
 //   其它                    → 返回含 n_samples 张 PNG 的真 zip
 //
+// 还 mock 了 /ai/encode-vibe（回固定裸字节）和 /user/subscription（假余额，按次扣减），
+// 供验证 vibe 编码链路与「余额差值＝真实消耗」的统计口径。
+//
 // 另外记录并发数与每次请求时刻，供 smoke 校验「串行」「限速间隔」。
 
 import express from 'express';
@@ -19,18 +22,27 @@ const PNG_1x1 = Buffer.from(
   'base64'
 );
 
+// encode-vibe 的假返回：一段固定裸字节（真接口回的也是不透明二进制）
+export const MOCK_VIBE_BYTES = Buffer.from([0x4d, 0x4f, 0x43, 0x4b, 0x56, 0x49, 0x42, 0x45, 0x00, 0x01, 0x02, 0xff]);
+
+// 假余额里一次生图的扣点（随便取的固定值，只要与估算不同就能验出记的是实测值）
+export const MOCK_GENERATE_COST = 7;
+
 export function createMockApp() {
   const app = express();
   app.use(express.json({ limit: '20mb' }));
 
   const state = {
     calls: 0,
+    encodeCalls: 0,
     inflight: 0,
+    // 假余额：generate-image 每次扣 GENERATE_COST，encode-vibe 扣 2（验「实测差值」口径）
+    balance: 10000,
+    subscriptionDown: false,
     maxInflight: 0,
     concurrencyViolation: false,
     callTimes: [], // 每次进入 generate 的时间戳
     seen: new Map(), // MOCK_429xN 的计数
-    balance: 10000,
     purchasedBalance: 0,
     batteryPercent: 100,
     subscriptionEnabled: true,
@@ -69,7 +81,7 @@ export function createMockApp() {
         && Number(req.body?.parameters?.n_samples || 1) === 1
         && Number(req.body?.parameters?.steps || 0) <= 28;
       if (freeV5 && state.batteryPercent > 0) state.batteryPercent = Math.max(0, state.batteryPercent - 1);
-      else state.balance -= 7;
+      else state.balance -= MOCK_GENERATE_COST;
       res.set('Content-Type', 'application/zip');
       res.send(buf);
     } finally {
@@ -77,6 +89,7 @@ export function createMockApp() {
     }
   });
 
+  // vibe 编码：回一段固定裸字节，并计入串行/限速统计（与生图同一条队列）
   app.post('/ai/encode-vibe', async (req, res) => {
     state.calls++;
     state.callTimes.push(Date.now());
@@ -84,16 +97,21 @@ export function createMockApp() {
     state.maxInflight = Math.max(state.maxInflight, state.inflight);
     if (state.inflight > 1) state.concurrencyViolation = true;
     try {
-      await delay(30);
+      await delay(40);
+      state.encodeCalls++;
       state.balance -= 2;
-      res.type('application/octet-stream').send(Buffer.from([0xde, 0xad, 0xbe, 0xef]));
+      res.set('Content-Type', 'application/octet-stream');
+      res.send(MOCK_VIBE_BYTES);
     } finally {
       state.inflight--;
     }
   });
 
+  // 账号接口：查 Anlas 余额（真服务在 api.novelai.net，测试里与生图共用一个 mock）
   app.get('/user/subscription', (req, res) => {
-    if (!state.subscriptionEnabled) return res.status(503).json({ error: 'mock subscription disabled' });
+    if (!state.subscriptionEnabled || state.subscriptionDown) {
+      return res.status(503).json({ error: 'mock subscription disabled' });
+    }
     res.json({
       active: true,
       tier: 3,
@@ -109,10 +127,17 @@ export function createMockApp() {
       },
     });
   });
+  // 开关：模拟余额接口挂掉（验记账回落估算）
+  app.post('/mock/subscription-down', (req, res) => {
+    state.subscriptionDown = String(req.query.on || '') !== 'false';
+    res.json({ ok: true, down: state.subscriptionDown });
+  });
+  app.get('/mock/balance', (req, res) => res.json({ balance: state.balance }));
 
   app.get('/mock/stats', (req, res) => {
     res.json({
       calls: state.calls,
+      encodeCalls: state.encodeCalls,
       maxInflight: state.maxInflight,
       concurrencyViolation: state.concurrencyViolation,
       callTimes: state.callTimes,
@@ -122,6 +147,7 @@ export function createMockApp() {
   });
   app.post('/mock/reset', (req, res) => {
     state.calls = 0;
+    state.encodeCalls = 0;
     state.maxInflight = 0;
     state.concurrencyViolation = false;
     state.callTimes = [];
@@ -130,6 +156,7 @@ export function createMockApp() {
     state.purchasedBalance = 0;
     state.batteryPercent = 100;
     state.subscriptionEnabled = true;
+    state.subscriptionDown = false;
     res.json({ ok: true });
   });
   app.post('/mock/subscription/:state', (req, res) => {

@@ -1,12 +1,13 @@
 // nai.js — 向 NovelAI 转发请求，带 429 退避重试 + 友好错误映射。
-// 结果是 zip 二进制，按 Buffer 原样返回（绝不当文本解析）。
+// 结果是二进制（生图 zip / vibe 编码原始字节），按 Buffer 原样返回（绝不当文本解析）。
 
 /**
- * 调用 NAI 生图接口，带重试。
+ * 调用 NAI 接口，带重试。
  * @param {object} body  客户端拼好的 NAI 请求体（透传，服务端不重写 prompt/尺寸/vibe）
  * @param {object} opts
  * @param {string} opts.baseUrl   NAI 基址（默认真地址，测试指向 mock）
  * @param {string} opts.apiKey    NAI token（仅服务端持有）
+ * @param {string} [opts.path]    接口路径（默认生图；vibe 编码传 /ai/encode-vibe）
  * @param {AbortSignal} [opts.signal]
  * @param {number} [opts.maxRetries]
  * @param {number} [opts.retryBaseMs]
@@ -15,9 +16,20 @@
  */
 export async function callNAIWithRetry(
   body,
-  { baseUrl, apiKey, signal, path = '/ai/generate-image', maxRetries = 10, retryBaseMs = 3000, retryMaxMs = 30000 } = {}
+  {
+    baseUrl,
+    apiKey,
+    path = '/ai/generate-image',
+    signal,
+    maxRetries = 10,
+    retryBaseMs = 3000,
+    retryMaxMs = 30000,
+  } = {}
 ) {
   const url = String(baseUrl).replace(/\/+$/, '') + path;
+  // 生图回 zip，encode-vibe 回一段裸字节；缺 content-type 时按接口兜底
+  const defaultContentType =
+    path === '/ai/generate-image' ? 'application/zip' : 'application/octet-stream';
   let attempt = 0;
 
   while (true) {
@@ -50,7 +62,7 @@ export async function callNAIWithRetry(
 
     if (res.ok) {
       const buf = Buffer.from(await res.arrayBuffer());
-      const contentType = res.headers.get('content-type') || (path === '/ai/encode-vibe' ? 'application/octet-stream' : 'application/zip');
+      const contentType = res.headers.get('content-type') || defaultContentType;
       return { buf, contentType };
     }
 
@@ -87,7 +99,7 @@ export async function fetchAnlasBalance({ baseUrl, apiKey, signal } = {}) {
 export async function fetchSubscription({ baseUrl, apiKey, signal } = {}) {
   try {
     const res = await fetch(String(baseUrl).replace(/\/+$/, '') + '/user/subscription', {
-      headers: { Authorization: 'Bearer ' + apiKey },
+      headers: { Authorization: 'Bearer ' + apiKey, Accept: 'application/json' },
       signal,
     });
     if (!res.ok) return null;

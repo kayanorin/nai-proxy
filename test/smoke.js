@@ -6,8 +6,9 @@
 // 跑法：npm install && npm run smoke
 
 import JSZip from 'jszip';
-import { createMockApp } from './mock-nai.js';
+import { createMockApp, MOCK_VIBE_BYTES, MOCK_GENERATE_COST } from './mock-nai.js';
 import { createApp } from '../server.js';
+import { estimateAnlas } from '../anlas.js';
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -107,6 +108,20 @@ async function submit(base, body, token = 'tok1') {
 }
 async function statusReq(base, id, token = 'tok1') {
   return fetch(base + '/status/' + id, { headers: token ? { 'X-Access-Token': token } : {} });
+}
+
+function vibeBody(ie = 0.5) {
+  return { image: 'QUJD', information_extracted: ie, model: 'nai-diffusion-4-5-full' };
+}
+async function encodeVibe(base, body, token = 'tok1') {
+  return fetch(base + '/encode-vibe', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      ...(token ? { 'X-Access-Token': token } : {}),
+    },
+    body: JSON.stringify(body),
+  });
 }
 async function submitId(base, body, token = 'tok1') {
   const r = await submit(base, body, token);
@@ -306,7 +321,7 @@ await test('encode-vibe：提交 → 轮询 → 裸字节结果 + 实测 2 点',
     assert(done.anlas_actual === 2, `实测应 2，实际 ${done.anlas_actual}`);
     const rr = await fetch(base + '/result/' + sub.job_id, { headers: { 'X-Access-Token': 'tok1' } });
     assert(!(rr.headers.get('content-disposition') || '').includes('zip'), '裸字节不应带 zip 附件头');
-    assert(Buffer.from(await rr.arrayBuffer()).equals(Buffer.from([0xde, 0xad, 0xbe, 0xef])), '编码字节应原样返回');
+    assert(Buffer.from(await rr.arrayBuffer()).equals(MOCK_VIBE_BYTES), '编码字节应原样返回');
   }));
 
 await test('encode-vibe：鉴权与字段校验', () =>
@@ -376,7 +391,6 @@ await test('V5 电量耗尽必须明确确认 Anlas', () =>
     const done = await waitJob(base, submitted.job_id);
     assert(done.status === 'done' && done.anlas_actual === 7, '确认任务应按实际 Anlas 结算');
   }));
-
 await test('活动 self API：只返回本人 24 小时数据', () =>
   withProxy({ minGapMs: 10 }, async ({ base }) => {
     await drainAndReset();
@@ -414,6 +428,90 @@ await test('活动 admin API：聚合、参数校验与 reset', () =>
     const empty = await (await fetch(base + '/stats/activity?days=7&user=all', { headers })).json();
     assert(empty.totals.requests === 0, 'reset 后活动历史应清空');
   }));
+
+await test('vibe 编码：提交 → 轮询 → 取裸字节，计 2 Anlas', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    const r = await encodeVibe(base, vibeBody());
+    assert(r.status === 200, `提交应 200，实际 ${r.status}`);
+    const sub = await r.json();
+    assert(sub.anlas_est === 2, `估点应为 2，实际 ${sub.anlas_est}`);
+    const j = await waitJob(base, sub.job_id);
+    assert(j.status === 'done', `应 done，实际 ${j.status} ${j.error || ''}`);
+    const rr = await fetch(base + '/result/' + sub.job_id, { headers: { 'X-Access-Token': 'tok1' } });
+    assert(rr.status === 200, `取结果应 200，实际 ${rr.status}`);
+    assert(!rr.headers.get('content-disposition'), 'vibe 结果不该带 zip 附件头');
+    const got = Buffer.from(await rr.arrayBuffer());
+    assert(got.equals(MOCK_VIBE_BYTES), 'vibe 字节应与 mock 返回一致');
+    const st = await (await fetch(base + '/stats', { headers: { 'X-Access-Token': 'admin' } })).json();
+    assert(st.tokens?.tok1?.anlas === 2, `该令牌应记 2 Anlas，实际 ${st.tokens?.tok1?.anlas}`);
+  }));
+
+await test('vibe 编码：缺字段 → 400，无令牌 → 401', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    const bad = await encodeVibe(base, { model: 'nai-diffusion-4-5-full' });
+    assert(bad.status === 400, `缺字段应 400，实际 ${bad.status}`);
+    const noTok = await encodeVibe(base, vibeBody(), null);
+    assert(noTok.status === 401, `无令牌应 401，实际 ${noTok.status}`);
+  }));
+
+await test('点数统计走实测：记的是余额差值而非估算', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    await drainAndReset();
+    // 1024×1024 / 28 步 / 2 张：估算是 20，mock 每次生图只扣 MOCK_GENERATE_COST
+    const body = naiBody('measured', { n_samples: 2, width: 1024, height: 1024, steps: 28 });
+    assert(estimateAnlas(body, { opus: true }) === 20, '前提：该 body 的估算应为 20');
+    const j = await waitJob(base, await submitId(base, body));
+    assert(j.status === 'done', `应 done，实际 ${j.status}`);
+    assert(j.anlas_actual === MOCK_GENERATE_COST, `/status 应回实测 ${MOCK_GENERATE_COST}，实际 ${j.anlas_actual}`);
+    const st = await (await fetch(base + '/stats', { headers: { 'X-Access-Token': 'admin' } })).json();
+    assert(st.tokens?.tok1?.anlas === MOCK_GENERATE_COST,
+      `应记实测 ${MOCK_GENERATE_COST}，实际 ${st.tokens?.tok1?.anlas}`);
+  }));
+
+await test('余额接口挂掉 → 记账回落估算，任务不受影响', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    await drainAndReset();
+    await fetch(MOCK_BASE + '/mock/subscription-down', { method: 'POST' });
+    try {
+      const body = naiBody('fallback', { n_samples: 2, width: 1024, height: 1024, steps: 28 });
+      const j = await waitJob(base, await submitId(base, body));
+      assert(j.status === 'done', `应 done，实际 ${j.status} ${j.error || ''}`);
+      assert(j.anlas_actual == null, '查不到余额时不该有实测值');
+      const st = await (await fetch(base + '/stats', { headers: { 'X-Access-Token': 'admin' } })).json();
+      assert(st.tokens?.tok1?.anlas === 20, `应回落估算 20，实际 ${st.tokens?.tok1?.anlas}`);
+    } finally {
+      await fetch(MOCK_BASE + '/mock/subscription-down?on=false', { method: 'POST' });
+    }
+  }));
+
+await test('GET /balance：回当前余额，无令牌 401', () =>
+  withProxy({ minGapMs: 10 }, async ({ base }) => {
+    await drainAndReset();
+    const noTok = await fetch(base + '/balance');
+    assert(noTok.status === 401, `无令牌应 401，实际 ${noTok.status}`);
+    const r = await fetch(base + '/balance', { headers: { 'X-Access-Token': 'tok1' } });
+    assert(r.status === 200, `应 200，实际 ${r.status}`);
+    const j = await r.json();
+    const real = (await (await fetch(MOCK_BASE + '/mock/balance')).json()).balance;
+    assert(j.balance === real, `余额应为 ${real}，实际 ${j.balance}`);
+  }));
+
+await test('估算公式：局部重绘按 strength 折算、precise 参考每张 5 点', () => {
+  const free = { parameters: { width: 1024, height: 1024, steps: 28, n_samples: 1 } };
+  assert(estimateAnlas(free, { opus: true }) === 0, 'Opus 免费档单张 txt2img 应为 0');
+
+  const director = {
+    parameters: { ...free.parameters, director_reference_images: ['ref1'] },
+  };
+  assert(estimateAnlas(director, { opus: true }) === 5, `带 1 张 precise 参考应为 5，实际 ${estimateAnlas(director, { opus: true })}`);
+
+  const infill = { parameters: { ...free.parameters, image: 'base64', strength: 0.5 } };
+  assert(estimateAnlas(infill, { opus: true }) === 0, '免费档内的局部重绘仍为 0');
+
+  // 超出免费档（2 张）时 strength 折算才看得出来：20 → ceil(20×0.5)=10，两张按 1 张计
+  const infillPaid = { parameters: { ...infill.parameters, n_samples: 2 } };
+  assert(estimateAnlas(infillPaid, { opus: true }) === 10, `strength 0.5 应折半为 10，实际 ${estimateAnlas(infillPaid, { opus: true })}`);
+});
 
 console.log(`\n${failed ? '✗ 失败' : '✓ 全部通过'}：${passed} / ${passed + failed}`);
 mock.server.close();
